@@ -1,0 +1,6 @@
+{
+  "name": "ContentX — Verified Content Transformation & Provenance Platform",
+  "description": "One Source. Every Format. Verified at Every Step. Domain-aware AI content transformation, Fact Registry, selective RAG, 15-point validation, claim traceability, and cryptographic provenance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
