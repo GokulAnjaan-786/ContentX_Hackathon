@@ -30,6 +30,7 @@ interface OutputStudioViewProps {
   documents: SourceDocument[];
   factsByDoc: Record<string, FactRegistryItem[]>;
   selectedDocId: string;
+  authToken?: string | null;
   onSelectDocId: (id: string) => void;
   onInspectClaim: (claim: OutputClaim, doc: SourceDocument | null) => void;
   onInspectFactId: (factId: string, docId: string) => void;
@@ -61,6 +62,7 @@ export const OutputStudioView: React.FC<OutputStudioViewProps> = ({
   outputs,
   documents,
   selectedDocId,
+  authToken,
   onSelectDocId,
   onInspectClaim,
   onInspectFactId,
@@ -151,9 +153,15 @@ export const OutputStudioView: React.FC<OutputStudioViewProps> = ({
     setSavingEdit(true);
     try {
       const parsed = JSON.parse(editJsonText);
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`;
+      }
       const res = await fetch(`/api/outputs/${currentOutput.output_id}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ content: parsed }),
       });
       const data = await res.json();

@@ -15,6 +15,7 @@ import {
   FileText,
   Layers,
   LayoutDashboard,
+  LogOut,
   Plus,
   RotateCcw,
   Search,
@@ -26,6 +27,7 @@ import {
   Workflow,
 } from 'lucide-react';
 import { AuthModal } from './components/AuthModal.tsx';
+import { AuthPage, AuthRouteMode } from './components/AuthPage.tsx';
 import { ClaimInspectorDrawer } from './components/ClaimInspectorDrawer.tsx';
 import { OutputStudioView } from './components/OutputStudioView.tsx';
 import { TransformWorkspace } from './components/TransformWorkspace.tsx';
@@ -58,13 +60,79 @@ type NavTab =
   | 'analytics'
   | 'settings';
 
+const TAB_TO_PATH: Record<NavTab, string> = {
+  dashboard: '/dashboard',
+  transform: '/transform',
+  fact_registry: '/facts',
+  outputs: '/outputs',
+  verify: '/verify',
+  provenance: '/provenance',
+  history: '/history',
+  analytics: '/analytics',
+  settings: '/settings',
+};
+
+const PROTECTED_PATHS: Record<string, NavTab> = {
+  '/dashboard': 'dashboard',
+  '/transform': 'transform',
+  '/facts': 'fact_registry',
+  '/fact_registry': 'fact_registry',
+  '/outputs': 'outputs',
+  '/provenance': 'provenance',
+  '/history': 'history',
+  '/analytics': 'analytics',
+  '/settings': 'settings',
+};
+
+const AUTH_STORAGE_KEY = 'contentx_auth_token';
+
+function getStoredAuthToken(): string | null {
+  try {
+    return (
+      localStorage.getItem(AUTH_STORAGE_KEY) ||
+      sessionStorage.getItem(AUTH_STORAGE_KEY)
+    );
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredAuthToken(token: string, rememberMe: boolean): void {
+  try {
+    if (rememberMe) {
+      localStorage.setItem(AUTH_STORAGE_KEY, token);
+      sessionStorage.removeItem(AUTH_STORAGE_KEY);
+    } else {
+      sessionStorage.setItem(AUTH_STORAGE_KEY, token);
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+function clearStoredAuthToken(): void {
+  try {
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    sessionStorage.removeItem(AUTH_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
+  const [activeTab, setActiveTabState] = useState<NavTab>('dashboard');
   const [includeDemo, setIncludeDemo] = useState<boolean>(true);
 
-  // Auth & RBAC State
+  // Mandatory Authentication & Session State
+  const [authChecked, setAuthChecked] = useState<boolean>(false);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(() =>
+    getStoredAuthToken()
+  );
+  const [authRouteMode, setAuthRouteMode] = useState<AuthRouteMode>('login');
+  const [publicVerifyMode, setPublicVerifyMode] = useState<boolean>(false);
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState<boolean>(false);
 
   // Core Data State
@@ -133,15 +201,87 @@ export default function App() {
   const [cfgModelName, setCfgModelName] = useState<string>('qwen2.5:7b');
   const [cfgSavedBanner, setCfgSavedBanner] = useState<string | null>(null);
 
-  const authHeaders = (): Record<string, string> => {
+  const setActiveTab = (tab: NavTab) => {
+    setActiveTabState(tab);
+    const targetPath =
+      tab === 'verify' && targetVerificationId
+        ? `/verify/${encodeURIComponent(targetVerificationId)}`
+        : TAB_TO_PATH[tab] || '/dashboard';
+    if (window.location.pathname !== targetPath) {
+      window.history.pushState({}, '', targetPath);
+    }
+  };
+
+  const authHeaders = (tokenOverride?: string | null): Record<string, string> => {
     const h: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (authToken) h['Authorization'] = `Bearer ${authToken}`;
+    const effectiveToken =
+      tokenOverride !== undefined ? tokenOverride : authToken;
+    if (effectiveToken) h['Authorization'] = `Bearer ${effectiveToken}`;
     return h;
   };
 
-  const fetchAllPlatformData = async (demoFlag = includeDemo) => {
+  const handleLogout = async (notice?: string) => {
+    const tokenToRevoke = authToken || getStoredAuthToken();
+    if (tokenToRevoke) {
+      try {
+        await fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tokenToRevoke}`,
+          },
+        });
+      } catch {
+        // Proceed with client session cleanup even if network call fails
+      }
+    }
+    clearStoredAuthToken();
+    setCurrentUser(null);
+    setAuthToken(null);
+    setAuthModalOpen(false);
+    setPublicVerifyMode(false);
+    setAuthRouteMode('login');
+    setSessionNotice(notice || null);
+    setDocuments([]);
+    setAllFacts([]);
+    setOutputs([]);
+    setProvenanceList([]);
+    setHistoryJobs([]);
+    setAuditLogs([]);
+    if (window.location.pathname !== '/login') {
+      window.history.replaceState({}, '', '/login');
+    }
+  };
+
+  const handleAuthenticated = (
+    user: User,
+    token: string,
+    rememberMe = true
+  ) => {
+    saveStoredAuthToken(token, rememberMe);
+    setCurrentUser(user);
+    setAuthToken(token);
+    setSessionNotice(null);
+    setPublicVerifyMode(false);
+    setActiveTabState('dashboard');
+    if (window.location.pathname !== '/dashboard') {
+      window.history.pushState({}, '', '/dashboard');
+    }
+  };
+
+  const fetchAllPlatformData = async (
+    demoFlag = includeDemo,
+    tokenOverride?: string | null
+  ) => {
+    const effectiveToken =
+      tokenOverride !== undefined ? tokenOverride : authToken;
+    if (!effectiveToken) {
+      setLoading(false);
+      return;
+    }
     try {
       const q = `?includeDemo=${demoFlag}`;
+      const headers = authHeaders(effectiveToken);
       const [
         meRes,
         docsRes,
@@ -153,16 +293,26 @@ export default function App() {
         provStatRes,
         domRes,
       ] = await Promise.all([
-        fetch('/api/auth/me', { headers: authHeaders() }),
-        fetch(`/api/documents${q}`),
-        fetch(`/api/facts${q}`),
-        fetch(`/api/outputs${q}`),
-        fetch(`/api/provenance${q}`),
-        fetch(`/api/history${q}`),
-        fetch(`/api/analytics${q}`),
-        fetch('/api/provider-status'),
-        fetch('/api/domains'),
+        fetch('/api/auth/me', { headers }),
+        fetch(`/api/documents${q}`, { headers }),
+        fetch(`/api/facts${q}`, { headers }),
+        fetch(`/api/outputs${q}`, { headers }),
+        fetch(`/api/provenance${q}`, { headers }),
+        fetch(`/api/history${q}`, { headers }),
+        fetch(`/api/analytics${q}`, { headers }),
+        fetch('/api/provider-status', { headers }),
+        fetch('/api/domains', { headers }),
       ]);
+
+      if (meRes.status === 401) {
+        const errData = await meRes.json().catch(() => ({}));
+        await handleLogout(
+          errData.code === 'SESSION_EXPIRED'
+            ? 'Your session has expired. Please sign in again.'
+            : 'Authentication required. Please sign in to access ContentX.'
+        );
+        return;
+      }
 
       const [
         meData,
@@ -186,7 +336,7 @@ export default function App() {
         domRes.json(),
       ]);
 
-      if (meData.user && !currentUser) {
+      if (meData.user) {
         setCurrentUser(meData.user);
       }
 
@@ -215,7 +365,7 @@ export default function App() {
 
       if (targetDocId) {
         setSelectedDocId(targetDocId);
-        await fetchSingleDocumentDetails(targetDocId);
+        await fetchSingleDocumentDetails(targetDocId, effectiveToken);
       } else {
         setSelectedDocId('');
         setActiveDocChunks([]);
@@ -226,9 +376,14 @@ export default function App() {
     }
   };
 
-  const fetchSingleDocumentDetails = async (docId: string) => {
+  const fetchSingleDocumentDetails = async (
+    docId: string,
+    tokenOverride?: string | null
+  ) => {
     if (!docId || docId === 'all') return;
-    const res = await fetch(`/api/documents/${docId}`);
+    const res = await fetch(`/api/documents/${docId}`, {
+      headers: authHeaders(tokenOverride),
+    });
     if (res.ok) {
       const data = await res.json();
       setActiveDocChunks(data.chunks || []);
@@ -236,9 +391,145 @@ export default function App() {
     }
   };
 
+  // Initial route & session verification on application load
   useEffect(() => {
-    fetchAllPlatformData(includeDemo);
-  }, [includeDemo, authToken]);
+    const verifyInitialSessionAndRoute = async () => {
+      const pathname = window.location.pathname || '/';
+      const storedToken = getStoredAuthToken();
+
+      // Check if user opened a public verification link (/verify or /verify/:id)
+      if (pathname === '/verify' || pathname.startsWith('/verify/')) {
+        const verId = pathname.startsWith('/verify/')
+          ? decodeURIComponent(pathname.slice('/verify/'.length))
+          : 'VER-DEMO-CYB-01';
+        if (verId) {
+          setTargetVerificationId(verId);
+        }
+      }
+
+      if (!storedToken) {
+        setCurrentUser(null);
+        setAuthToken(null);
+        setAuthChecked(true);
+        setLoading(false);
+
+        if (pathname === '/register') {
+          setAuthRouteMode('register');
+        } else if (pathname === '/forgot-password') {
+          setAuthRouteMode('forgot-password');
+        } else if (pathname === '/verify' || pathname.startsWith('/verify/')) {
+          setPublicVerifyMode(true);
+        } else {
+          setAuthRouteMode('login');
+          if (PROTECTED_PATHS[pathname]) {
+            setSessionNotice(
+              'Authentication required. Please sign in to access ContentX.'
+            );
+          }
+          if (pathname !== '/login') {
+            window.history.replaceState({}, '', '/login');
+          }
+        }
+        return;
+      }
+
+      // Validate stored token with backend
+      try {
+        const res = await fetch('/api/auth/me', {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${storedToken}`,
+          },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.authenticated || !data.user) {
+          clearStoredAuthToken();
+          setCurrentUser(null);
+          setAuthToken(null);
+          setAuthChecked(true);
+          setLoading(false);
+          setAuthRouteMode('login');
+          setSessionNotice(
+            data.code === 'SESSION_EXPIRED'
+              ? 'Your session has expired. Please sign in again.'
+              : 'Please sign in to access ContentX.'
+          );
+          if (pathname !== '/login') {
+            window.history.replaceState({}, '', '/login');
+          }
+          return;
+        }
+
+        setCurrentUser(data.user);
+        setAuthToken(storedToken);
+        setAuthChecked(true);
+
+        if (PROTECTED_PATHS[pathname]) {
+          setActiveTabState(PROTECTED_PATHS[pathname]);
+        } else if (pathname === '/verify' || pathname.startsWith('/verify/')) {
+          setActiveTabState('verify');
+        } else {
+          setActiveTabState('dashboard');
+          window.history.replaceState({}, '', '/dashboard');
+        }
+      } catch {
+        clearStoredAuthToken();
+        setCurrentUser(null);
+        setAuthToken(null);
+        setAuthChecked(true);
+        setLoading(false);
+        if (window.location.pathname !== '/login') {
+          window.history.replaceState({}, '', '/login');
+        }
+      }
+    };
+
+    verifyInitialSessionAndRoute();
+
+    const handlePopState = () => {
+      const path = window.location.pathname || '/';
+      if (path === '/verify' || path.startsWith('/verify/')) {
+        const vid = path.startsWith('/verify/')
+          ? decodeURIComponent(path.slice('/verify/'.length))
+          : '';
+        if (vid) setTargetVerificationId(vid);
+        if (getStoredAuthToken()) {
+          setActiveTabState('verify');
+        } else {
+          setPublicVerifyMode(true);
+        }
+        return;
+      }
+      if (!getStoredAuthToken()) {
+        setPublicVerifyMode(false);
+        if (path === '/register') setAuthRouteMode('register');
+        else if (path === '/forgot-password')
+          setAuthRouteMode('forgot-password');
+        else {
+          setAuthRouteMode('login');
+          if (PROTECTED_PATHS[path]) {
+            setSessionNotice(
+              'Authentication required. Please sign in to access ContentX.'
+            );
+            window.history.replaceState({}, '', '/login');
+          }
+        }
+        return;
+      }
+      if (PROTECTED_PATHS[path]) {
+        setActiveTabState(PROTECTED_PATHS[path]);
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  useEffect(() => {
+    if (authChecked && authToken && currentUser) {
+      fetchAllPlatformData(includeDemo, authToken);
+    }
+  }, [authChecked, includeDemo, authToken]);
 
   const handleSelectDoc = async (docId: string) => {
     setSelectedDocId(docId);
@@ -353,6 +644,99 @@ export default function App() {
     { id: 'settings', label: 'Settings', icon: SettingsIcon },
   ];
 
+  // ============================================================
+  // MANDATORY AUTHENTICATION ENTRY POINT & PUBLIC /VERIFY/:ID GUARD
+  // ============================================================
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-white font-mono text-xs">
+        Verifying ContentX session...
+      </div>
+    );
+  }
+
+  if (!currentUser || !authToken) {
+    if (publicVerifyMode) {
+      return (
+        <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
+          <header className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3.5">
+            <div className="flex items-center gap-3">
+              <span className="text-lg font-bold tracking-tight text-slate-900">
+                ContentX
+              </span>
+              <span className="text-xs font-mono text-slate-500">
+                Public Provenance & Integrity Verification Portal
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setPublicVerifyMode(false);
+                setAuthRouteMode('login');
+                window.history.pushState({}, '', '/login');
+              }}
+              className="bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 transition-colors"
+            >
+              Sign In to ContentX
+            </button>
+          </header>
+          <main className="flex-1 p-4 sm:p-6 lg:p-8">
+            <div className="mx-auto max-w-6xl">
+              <VerificationAndProvenanceView
+                mode="verify"
+                provenanceList={[]}
+                initialVerificationId={
+                  targetVerificationId || 'VER-DEMO-CYB-01'
+                }
+                userRole="Viewer"
+                authToken={null}
+                onSelectVerificationId={(vid) => {
+                  setTargetVerificationId(vid);
+                  window.history.pushState(
+                    {},
+                    '',
+                    `/verify/${encodeURIComponent(vid)}`
+                  );
+                }}
+                onRefreshProvenance={() => {}}
+              />
+            </div>
+          </main>
+        </div>
+      );
+    }
+
+    return (
+      <AuthPage
+        mode={authRouteMode}
+        sessionNotice={sessionNotice}
+        onChangeMode={(nextMode) => {
+          setAuthRouteMode(nextMode);
+          const nextPath =
+            nextMode === 'login'
+              ? '/login'
+              : nextMode === 'register'
+              ? '/register'
+              : '/forgot-password';
+          if (window.location.pathname !== nextPath) {
+            window.history.pushState({}, '', nextPath);
+          }
+        }}
+        onAuthenticated={handleAuthenticated}
+        onOpenPublicVerification={() => {
+          const defaultVerifyId = targetVerificationId || 'VER-DEMO-CYB-01';
+          setTargetVerificationId(defaultVerifyId);
+          setPublicVerifyMode(true);
+          window.history.pushState(
+            {},
+            '',
+            `/verify/${encodeURIComponent(defaultVerifyId)}`
+          );
+        }}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
       {/* TOP BAR CONTRACT: Strictly 3 Zones (Brand Wordmark, 5 Nav Links, 2 Primary Actions) */}
@@ -428,8 +812,8 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: 2 Primary Actions (Upload Source + RBAC Account) */}
-        <div className="flex items-center gap-3">
+        {/* Zone 3: Primary Actions (Upload Source + RBAC Account + Logout) */}
+        <div className="flex items-center gap-2.5">
           <button
             type="button"
             onClick={() => setActiveTab('transform')}
@@ -441,10 +825,18 @@ export default function App() {
             type="button"
             onClick={() => setAuthModalOpen(true)}
             className="border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-800 hover:bg-slate-100 transition-colors whitespace-nowrap font-mono"
+            title="Inspect session or switch RBAC role"
           >
-            {currentUser
-              ? `${currentUser.name} · ${currentUser.role}`
-              : 'Sign In'}
+            {currentUser.name} · {currentUser.role}
+          </button>
+          <button
+            type="button"
+            onClick={() => handleLogout()}
+            className="inline-flex items-center gap-1.5 border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:border-red-300 hover:bg-red-50 hover:text-red-700 transition-colors whitespace-nowrap"
+            title="Sign out of ContentX"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            <span>Logout</span>
           </button>
         </div>
       </header>
@@ -800,7 +1192,8 @@ export default function App() {
                 chunks={activeDocChunks}
                 facts={activeDocFacts}
                 outputsForDoc={outputsForSelectedDoc}
-                userRole={currentUser?.role || 'Admin'}
+                userRole={currentUser?.role || 'Viewer'}
+                authToken={authToken}
                 onSelectDoc={handleSelectDoc}
                 onDocumentUploaded={async (newDoc) => {
                   await fetchAllPlatformData(includeDemo);
@@ -1062,6 +1455,7 @@ export default function App() {
                 documents={documents}
                 factsByDoc={{}}
                 selectedDocId={selectedDocId || 'all'}
+                authToken={authToken}
                 onSelectDocId={(id) => setSelectedDocId(id)}
                 onInspectClaim={(claim, doc) => {
                   const foundFact =
@@ -1091,7 +1485,8 @@ export default function App() {
                 mode={activeTab}
                 provenanceList={provenanceList}
                 initialVerificationId={targetVerificationId}
-                userRole={currentUser?.role || 'Admin'}
+                userRole={currentUser?.role || 'Viewer'}
+                authToken={authToken}
                 onSelectVerificationId={(vid) => {
                   setTargetVerificationId(vid);
                   setActiveTab('verify');
@@ -1644,12 +2039,10 @@ export default function App() {
         onClose={() => setAuthModalOpen(false)}
         currentUser={currentUser}
         onAuthenticated={(user, token) => {
-          setCurrentUser(user);
-          setAuthToken(token);
+          handleAuthenticated(user, token, true);
         }}
         onLogout={() => {
-          setCurrentUser(null);
-          setAuthToken(null);
+          handleLogout();
         }}
       />
     </div>

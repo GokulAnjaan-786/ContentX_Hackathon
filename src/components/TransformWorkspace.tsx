@@ -30,6 +30,7 @@ interface TransformWorkspaceProps {
   facts: FactRegistryItem[];
   outputsForDoc: GeneratedOutputRecord[];
   userRole: UserRole;
+  authToken?: string | null;
   onSelectDoc: (docId: string) => void;
   onDocumentUploaded: (doc: SourceDocument) => void;
   onGenerationCompleted: (
@@ -136,6 +137,7 @@ export const TransformWorkspace: React.FC<TransformWorkspaceProps> = ({
   facts,
   outputsForDoc,
   userRole,
+  authToken,
   onSelectDoc,
   onDocumentUploaded,
   onGenerationCompleted,
@@ -200,6 +202,16 @@ export const TransformWorkspace: React.FC<TransformWorkspaceProps> = ({
     return true;
   });
 
+  const getAuthHeaders = (): Record<string, string> => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+    return headers;
+  };
+
   const handleForensicReprocess = async () => {
     if (!selectedDoc) return;
     setReprocessing(true);
@@ -207,7 +219,10 @@ export const TransformWorkspace: React.FC<TransformWorkspaceProps> = ({
     try {
       const res = await fetch(
         `/api/documents/${selectedDoc.document_id}/reprocess`,
-        { method: 'POST' }
+        {
+          method: 'POST',
+          headers: getAuthHeaders(),
+        }
       );
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Reprocess failed');
@@ -282,7 +297,7 @@ export const TransformWorkspace: React.FC<TransformWorkspaceProps> = ({
     try {
       const res = await fetch('/api/documents/upload', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify({
           filename: finalName,
           mimeType: uploadMime,
@@ -342,7 +357,7 @@ export const TransformWorkspace: React.FC<TransformWorkspaceProps> = ({
     try {
       const res = await fetch('/api/transform', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify({
           documentId: selectedDoc.document_id,
           audience: selectedAudience,

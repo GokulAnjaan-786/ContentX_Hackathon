@@ -19,13 +19,15 @@ dotenv.config();
 
 interface AuthenticatedRequest extends Request {
   user?: User;
+  authToken?: string;
+  sessionExpired?: boolean;
 }
 
 const runtimeSettings = {
   execution_mode: (process.env.OLLAMA_GENERATION_EXECUTION_MODE ||
     'sequential') as 'sequential' | 'parallel',
   chunk_target_words: Number(process.env.CHUNK_TARGET_WORDS || 600),
-  chunk_overlap_words: Number(process.env.CHUNK_OVERLAP_WORDS || 50),
+  chunk_overlap_words: Number(process.env.OLLAMA_OVERLAP_WORDS || process.env.CHUNK_OVERLAP_WORDS || 50),
   ollama_generation_model: process.env.OLLAMA_GENERATION_MODEL || 'qwen2.5:7b',
   ollama_embedding_model:
     process.env.OLLAMA_EMBEDDING_MODEL || 'bge-m3:latest',
@@ -41,17 +43,31 @@ function attachUserMiddleware(
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
-    const sessionUser = dbStore.sessions.get(token);
-    if (sessionUser) {
-      req.user = sessionUser;
+    const verification = dbStore.verifySessionToken(token);
+    if (verification.valid && verification.user) {
+      req.user = verification.user;
+      req.authToken = token;
       return next();
     }
+    if (verification.expired) {
+      req.sessionExpired = true;
+    }
   }
-  // Default fallback to Admin session for seamless preview while supporting explicit login/logout/RBAC switching
-  const defaultAdmin = dbStore.users.get('admin@contentx.io');
-  if (defaultAdmin) {
-    const { password_hash: _, ...cleanUser } = defaultAdmin;
-    req.user = cleanUser;
+  next();
+}
+
+function requireAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) {
+  if (!req.user) {
+    return res.status(401).json({
+      error: req.sessionExpired
+        ? 'Your session has expired. Please sign in again.'
+        : 'Authentication required. Please sign in to access ContentX.',
+      code: req.sessionExpired ? 'SESSION_EXPIRED' : 'UNAUTHENTICATED',
+    });
   }
   next();
 }
@@ -59,7 +75,12 @@ function attachUserMiddleware(
 function requireRole(allowedRoles: UserRole[]) {
   return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required.' });
+      return res.status(401).json({
+        error: req.sessionExpired
+          ? 'Your session has expired. Please sign in again.'
+          : 'Authentication required. Please sign in to access ContentX.',
+        code: req.sessionExpired ? 'SESSION_EXPIRED' : 'UNAUTHENTICATED',
+      });
     }
     if (!allowedRoles.includes(req.user.role)) {
       return res.status(403).json({
@@ -81,22 +102,26 @@ export async function createApp() {
   // AUTHENTICATION & RBAC ENDPOINTS
   // ============================================================
   app.post('/api/auth/login', (req: Request, res: Response) => {
-    const { email, password } = req.body || {};
+    const { email, password, rememberMe } = req.body || {};
     if (!email || !password) {
       return res
         .status(400)
-        .json({ error: 'Email and password are required.' });
+        .json({ error: 'Invalid email or password. Please try again.' });
     }
     const stored = dbStore.users.get(String(email).toLowerCase().trim());
     if (!stored) {
-      return res.status(401).json({ error: 'Invalid credentials.' });
+      return res
+        .status(401)
+        .json({ error: 'Invalid email or password. Please try again.' });
     }
     const hashed = dbStore.hashPassword(String(password));
     if (stored.password_hash !== hashed) {
-      return res.status(401).json({ error: 'Invalid credentials.' });
+      return res
+        .status(401)
+        .json({ error: 'Invalid email or password. Please try again.' });
     }
     const { password_hash: _, ...user } = stored;
-    const token = dbStore.createToken(user);
+    const token = dbStore.createToken(user, rememberMe !== false);
     dbStore.logAudit(
       user.email,
       user.role,
@@ -108,7 +133,8 @@ export async function createApp() {
   });
 
   app.post('/api/auth/register', (req: Request, res: Response) => {
-    const { email, password, name, organization, role } = req.body || {};
+    const { email, password, name, organization, role, rememberMe } =
+      req.body || {};
     if (!email || !password || !name) {
       return res
         .status(400)
@@ -128,14 +154,16 @@ export async function createApp() {
       id: `usr_${Date.now().toString(36)}`,
       email: normalizedEmail,
       name: String(name).trim(),
-      organization: String(organization || 'Enterprise Verification Team').trim(),
+      organization: String(
+        organization || 'Enterprise Verification Team'
+      ).trim(),
       role: assignedRole,
       created_at: new Date().toISOString(),
       password_hash: dbStore.hashPassword(String(password)),
     };
     dbStore.users.set(normalizedEmail, newUser);
     const { password_hash: _, ...cleanUser } = newUser;
-    const token = dbStore.createToken(cleanUser);
+    const token = dbStore.createToken(cleanUser, rememberMe !== false);
     dbStore.logAudit(
       cleanUser.email,
       cleanUser.role,
@@ -153,12 +181,49 @@ export async function createApp() {
     }
     return res.json({
       status: 'recovery_dispatched',
-      message: `If an account exists for ${email}, a cryptographic password reset token has been logged and issued.`,
+      message: `If an account exists for ${email}, a cryptographic password reset link has been dispatched.`,
     });
   });
 
+  app.post('/api/auth/logout', (req: AuthenticatedRequest, res: Response) => {
+    if (req.authToken) {
+      dbStore.revokeToken(req.authToken);
+    }
+    if (req.user) {
+      dbStore.logAudit(
+        req.user.email,
+        req.user.role,
+        'USER_LOGOUT',
+        req.user.id,
+        'User signed out and session token invalidated'
+      );
+    }
+    return res.json({ logged_out: true });
+  });
+
   app.get('/api/auth/me', (req: AuthenticatedRequest, res: Response) => {
-    return res.json({ user: req.user || null });
+    if (!req.user) {
+      return res.status(401).json({
+        authenticated: false,
+        user: null,
+        error: req.sessionExpired
+          ? 'Your session has expired. Please sign in again.'
+          : 'Unauthenticated',
+        code: req.sessionExpired ? 'SESSION_EXPIRED' : 'UNAUTHENTICATED',
+      });
+    }
+    return res.json({ authenticated: true, user: req.user });
+  });
+
+  // Protect all internal API routes except public /api/verification/*
+  app.use('/api', (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    if (
+      req.path.startsWith('/auth/') ||
+      req.path.startsWith('/verification/')
+    ) {
+      return next();
+    }
+    return requireAuth(req, res, next);
   });
 
   // ============================================================

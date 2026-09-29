@@ -415,11 +415,39 @@ async function runAllContentXTests() {
     'Infographic visual structure must adapt dynamically to the source document'
   );
   console.log(
-    '✓ [25/25] Dynamic Infographic structure & Presentation slide storytelling passed'
+    '✓ [25/26] Dynamic Infographic structure & Presentation slide storytelling passed'
+  );
+
+  // 26. Mandatory Authentication Session Verification, Tamper Rejection & Logout Revocation
+  const adminAccount = dbStore.users.get('admin@contentx.io');
+  assert(adminAccount, 'Seeded Admin account must exist');
+  const { password_hash: _, ...cleanAdmin } = adminAccount;
+  const sessionToken = dbStore.createToken(cleanAdmin, true);
+  const validCheck = dbStore.verifySessionToken(sessionToken);
+  assert.strictEqual(validCheck.valid, true);
+  assert.strictEqual(validCheck.user?.email, 'admin@contentx.io');
+  assert.strictEqual(validCheck.user?.role, 'Admin');
+
+  const forgedCheck = dbStore.verifySessionToken(`${sessionToken}tampered`);
+  assert.strictEqual(
+    forgedCheck.valid,
+    false,
+    'Tampered session token must be rejected'
+  );
+
+  dbStore.revokeToken(sessionToken);
+  const revokedCheck = dbStore.verifySessionToken(sessionToken);
+  assert.strictEqual(
+    revokedCheck.valid,
+    false,
+    'Revoked session token after logout must be rejected'
+  );
+  console.log(
+    '✓ [26/26] Mandatory authentication session verification, tamper rejection & logout revocation passed'
   );
 
   console.log('============================================================');
-  console.log('ALL 25 CONTENTX EDITORIAL & FORENSIC TEST SUITES PASSED (100%)');
+  console.log('ALL 26 CONTENTX AUTH, EDITORIAL & FORENSIC TEST SUITES PASSED');
   console.log('============================================================');
 }
 

@@ -51,6 +51,7 @@ export interface AuditLogEntry {
 class ContentXStore {
   public users = new Map<string, StoredUser>();
   public sessions = new Map<string, User>();
+  public revokedTokens = new Set<string>();
   public documents = new Map<string, SourceDocument>();
   public documentBuffers = new Map<string, Buffer>();
   public documentChunks = new Map<string, DocumentChunk[]>();
@@ -70,14 +71,64 @@ class ContentXStore {
       .toString('hex');
   }
 
-  public createToken(user: User): string {
-    const payload = `${user.id}:${user.email}:${user.role}:${Date.now()}`;
+  public createToken(user: User, rememberMe = true): string {
+    const ttlMs = rememberMe ? 7 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+    const expiresAt = Date.now() + ttlMs;
+    const payload = `${user.id}|${user.email}|${user.role}|${expiresAt}`;
     const sig = computeSha256(
-      `${payload}:${process.env.JWT_SECRET || 'contentx-secret'}`
+      `${payload}|${process.env.JWT_SECRET || 'contentx-secret'}`
     );
-    const token = Buffer.from(`${payload}:${sig}`).toString('base64url');
+    const token = Buffer.from(`${payload}|${sig}`).toString('base64url');
     this.sessions.set(token, user);
     return token;
+  }
+
+  public verifySessionToken(token: string): {
+    valid: boolean;
+    expired?: boolean;
+    user?: User;
+  } {
+    if (!token || this.revokedTokens.has(token)) {
+      return { valid: false };
+    }
+    try {
+      const decoded = Buffer.from(token, 'base64url').toString('utf-8');
+      const parts = decoded.split('|');
+      if (parts.length !== 5) {
+        return { valid: false };
+      }
+      const [id, email, role, expiresAtStr, sig] = parts;
+      const payload = `${id}|${email}|${role}|${expiresAtStr}`;
+      const expectedSig = computeSha256(
+        `${payload}|${process.env.JWT_SECRET || 'contentx-secret'}`
+      );
+      if (sig !== expectedSig) {
+        return { valid: false };
+      }
+      const expiresAt = Number(expiresAtStr);
+      if (Number.isNaN(expiresAt) || Date.now() > expiresAt) {
+        this.sessions.delete(token);
+        return { valid: false, expired: true };
+      }
+      const storedUser = this.users.get(email.toLowerCase());
+      if (storedUser) {
+        const { password_hash: _, ...cleanUser } = storedUser;
+        this.sessions.set(token, cleanUser);
+        return { valid: true, user: cleanUser };
+      }
+      const sessionUser = this.sessions.get(token);
+      if (sessionUser) {
+        return { valid: true, user: sessionUser };
+      }
+      return { valid: false };
+    } catch {
+      return { valid: false };
+    }
+  }
+
+  public revokeToken(token: string): void {
+    this.sessions.delete(token);
+    this.revokedTokens.add(token);
   }
 
   public logAudit(

@@ -20,6 +20,7 @@ interface VerificationAndProvenanceViewProps {
   provenanceList: ProvenanceRecord[];
   initialVerificationId: string;
   userRole: UserRole;
+  authToken?: string | null;
   onSelectVerificationId: (id: string) => void;
   onRefreshProvenance: () => void;
 }
@@ -31,6 +32,7 @@ export const VerificationAndProvenanceView: React.FC<
   provenanceList,
   initialVerificationId,
   userRole,
+  authToken,
   onSelectVerificationId,
   onRefreshProvenance,
 }) => {
@@ -83,9 +85,15 @@ export const VerificationAndProvenanceView: React.FC<
     verificationId: string,
     approvalStatus: 'APPROVED' | 'PENDING_REVIEW' | 'REJECTED'
   ) => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
     await fetch('/api/provenance', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ verificationId, approvalStatus }),
     });
     onRefreshProvenance();
