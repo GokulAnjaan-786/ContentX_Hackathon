@@ -34,8 +34,12 @@ import {
   validateChunkQuality,
 } from '../services/ingestionService.ts';
 
+import { config } from '../config/env.ts';
+import { postgresStore } from './postgres/postgresStore.ts';
+
 export interface StoredUser extends User {
   password_hash: string;
+  password_salt: string;
 }
 
 export interface AuditLogEntry {
@@ -64,11 +68,27 @@ class ContentXStore {
   public verificationIndex = new Map<string, string>(); // verification_id -> provenance_id
   public auditLogs: AuditLogEntry[] = [];
   public initialized = false;
+  public postgresActive = false;
 
-  public hashPassword(password: string): string {
+  public generateSalt(): string {
+    return crypto.randomBytes(16).toString('hex');
+  }
+
+  public hashPassword(password: string, salt: string): string {
     return crypto
-      .scryptSync(password, 'contentx-salt-2026', 32)
+      .scryptSync(password, salt, 32)
       .toString('hex');
+  }
+
+  public verifyPassword(password: string, user: StoredUser): boolean {
+    if (!password || !user || !user.password_hash || !user.password_salt) {
+      return false;
+    }
+    const computedHash = this.hashPassword(password, user.password_salt);
+    const a = Buffer.from(computedHash, 'hex');
+    const b = Buffer.from(user.password_hash, 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
   }
 
   public createToken(user: User, rememberMe = true): string {
@@ -76,10 +96,14 @@ class ContentXStore {
     const expiresAt = Date.now() + ttlMs;
     const payload = `${user.id}|${user.email}|${user.role}|${expiresAt}`;
     const sig = computeSha256(
-      `${payload}|${process.env.JWT_SECRET || 'contentx-secret'}`
+      `${payload}|${config.jwtSecret}`
     );
     const token = Buffer.from(`${payload}|${sig}`).toString('base64url');
     this.sessions.set(token, user);
+
+    if (this.postgresActive) {
+      postgresStore.saveSession(token, user, expiresAt).catch(() => {});
+    }
     return token;
   }
 
@@ -88,7 +112,7 @@ class ContentXStore {
     expired?: boolean;
     user?: User;
   } {
-    if (!token || this.revokedTokens.has(token)) {
+    if (!token || typeof token !== 'string' || this.revokedTokens.has(token)) {
       return { valid: false };
     }
     try {
@@ -100,11 +124,15 @@ class ContentXStore {
       const [id, email, role, expiresAtStr, sig] = parts;
       const payload = `${id}|${email}|${role}|${expiresAtStr}`;
       const expectedSig = computeSha256(
-        `${payload}|${process.env.JWT_SECRET || 'contentx-secret'}`
+        `${payload}|${config.jwtSecret}`
       );
-      if (sig !== expectedSig) {
+
+      const sigBuf = Buffer.from(sig, 'hex');
+      const expBuf = Buffer.from(expectedSig, 'hex');
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
         return { valid: false };
       }
+
       const expiresAt = Number(expiresAtStr);
       if (Number.isNaN(expiresAt) || Date.now() > expiresAt) {
         this.sessions.delete(token);
@@ -112,7 +140,7 @@ class ContentXStore {
       }
       const storedUser = this.users.get(email.toLowerCase());
       if (storedUser) {
-        const { password_hash: _, ...cleanUser } = storedUser;
+        const { password_hash: _, password_salt: __, ...cleanUser } = storedUser;
         this.sessions.set(token, cleanUser);
         return { valid: true, user: cleanUser };
       }
@@ -129,6 +157,10 @@ class ContentXStore {
   public revokeToken(token: string): void {
     this.sessions.delete(token);
     this.revokedTokens.add(token);
+
+    if (this.postgresActive) {
+      postgresStore.revokeToken(token).catch(() => {});
+    }
   }
 
   public logAudit(
@@ -138,7 +170,7 @@ class ContentXStore {
     resourceId: string,
     details: string
   ) {
-    this.auditLogs.unshift({
+    const entry: AuditLogEntry = {
       log_id: `aud_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
       timestamp: new Date().toISOString(),
       user_email: userEmail,
@@ -146,7 +178,14 @@ class ContentXStore {
       action,
       resource_id: resourceId,
       details,
-    });
+    };
+    this.auditLogs.unshift(entry);
+
+    if (this.postgresActive) {
+      postgresStore.saveAuditLog(entry).catch((err) => {
+        console.warn('[POSTGRES AUDIT WARNING]', err.message);
+      });
+    }
   }
 
   public async ingestDocument(params: {
@@ -310,6 +349,12 @@ class ContentXStore {
     for (const f of facts) {
       this.factById.set(`${docId}:${f.fact_id}`, f);
       this.factById.set(f.fact_id, f);
+    }
+
+    if (this.postgresActive) {
+      await postgresStore.saveDocument(doc, buffer);
+      await postgresStore.saveChunks(docId, chunks, fullVectors);
+      await postgresStore.saveFacts(docId, facts);
     }
 
     return doc;
@@ -488,8 +533,19 @@ class ContentXStore {
       job.failed_formats.length === orderedFormats.length
         ? 'failed'
         : job.failed_formats.length > 0
-        ? 'completed_with_warnings'
-        : 'completed';
+          ? 'completed_with_warnings'
+          : 'completed';
+
+    if (this.postgresActive) {
+      await postgresStore.saveJob(job);
+      for (const outRec of generatedOutputs) {
+        await postgresStore.saveOutput(outRec);
+      }
+      for (const provRec of provenanceList) {
+        await postgresStore.saveProvenance(provRec);
+      }
+      await postgresStore.saveDocument(doc);
+    }
 
     return { job, outputs: generatedOutputs, provenance: provenanceList };
   }
@@ -596,8 +652,8 @@ class ContentXStore {
     const avgScore =
       outs.length > 0
         ? Math.round(
-            outs.reduce((acc, o) => acc + o.validation.score, 0) / outs.length
-          )
+          outs.reduce((acc, o) => acc + o.validation.score, 0) / outs.length
+        )
         : 0;
     const groundingPassed = outs.filter(
       (o) => o.validation.gates.source_grounding.status === 'PASSED'
@@ -607,9 +663,9 @@ class ContentXStore {
     const avgLatency =
       outs.length > 0
         ? Math.round(
-            outs.reduce((acc, o) => acc + o.generation_latency_ms, 0) /
-              outs.length
-          )
+          outs.reduce((acc, o) => acc + o.generation_latency_ms, 0) /
+          outs.length
+        )
         : 0;
 
     const domainDist: Record<string, number> = {};
@@ -754,42 +810,158 @@ class ContentXStore {
     };
   }
 
-  public async seedInitialData() {
-    if (this.initialized) return;
-    this.initialized = true;
-
-    // 1. Seed RBAC Users (Admin, Editor, Viewer)
-    const defaultUsers: StoredUser[] = [
+  public async seedUsersOnly(): Promise<void> {
+    const seedUsersData = [
       {
         id: 'usr_admin_01',
         email: 'admin@contentx.io',
         name: 'Dr. Elena Vance',
         organization: 'ContentX Verification Authority',
-        role: 'Admin',
+        role: 'Admin' as UserRole,
         created_at: '2026-09-01T08:00:00Z',
-        password_hash: this.hashPassword('ContentX#2026'),
+        password: 'ContentX#2026',
       },
       {
         id: 'usr_editor_02',
         email: 'editor@contentx.io',
         name: 'Marcus Sterling',
         organization: 'Enterprise Threat & Research Desk',
-        role: 'Editor',
+        role: 'Editor' as UserRole,
         created_at: '2026-09-05T10:15:00Z',
-        password_hash: this.hashPassword('Editor#2026'),
+        password: 'Editor#2026',
       },
       {
         id: 'usr_viewer_03',
         email: 'viewer@contentx.io',
         name: 'Sora Takahashi',
         organization: 'External Compliance Audit',
-        role: 'Viewer',
+        role: 'Viewer' as UserRole,
         created_at: '2026-09-10T14:30:00Z',
-        password_hash: this.hashPassword('Viewer#2026'),
+        password: 'Viewer#2026',
       },
     ];
-    for (const u of defaultUsers) {
-      this.users.set(u.email.toLowerCase(), u);
+
+    for (const u of seedUsersData) {
+      const salt = this.generateSalt();
+      const hash = this.hashPassword(u.password, salt);
+      const userObj: StoredUser = {
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        organization: u.organization,
+        role: u.role,
+        created_at: u.created_at,
+        password_hash: hash,
+        password_salt: salt,
+      };
+      this.users.set(u.email.toLowerCase(), userObj);
+      if (this.postgresActive) {
+        await postgresStore.saveUser(userObj);
+      }
+    }
+
+    // Admin Bootstrap from Environment Configuration (Production Admin Bootstrap)
+    if (config.adminEmail && config.adminPassword) {
+      const normEmail = config.adminEmail.toLowerCase().trim();
+      if (!this.users.has(normEmail)) {
+        const salt = this.generateSalt();
+        const hash = this.hashPassword(config.adminPassword, salt);
+        const bootstrapAdmin: StoredUser = {
+          id: `usr_env_admin_${Date.now().toString(36)}`,
+          email: normEmail,
+          name: 'System Administrator (Bootstrapped)',
+          organization: 'ContentX Enterprise Administration',
+          role: 'Admin',
+          created_at: new Date().toISOString(),
+          password_hash: hash,
+          password_salt: salt,
+        };
+        this.users.set(normEmail, bootstrapAdmin);
+        if (this.postgresActive) {
+          await postgresStore.saveUser(bootstrapAdmin);
+        }
+        this.logAudit(
+          normEmail,
+          'Admin',
+          'ADMIN_BOOTSTRAP',
+          bootstrapAdmin.id,
+          'Bootstrapped production administrator account from environment configuration'
+        );
+      }
+    }
+  }
+
+  public async seedInitialData() {
+    if (this.initialized) return;
+    this.initialized = true;
+
+    if (config.storageMode === 'postgres') {
+      try {
+        this.postgresActive = await postgresStore.initializeDatabase();
+      } catch (err: any) {
+        if (config.databaseRequired) {
+          throw err;
+        }
+        this.postgresActive = false;
+      }
+    }
+
+    if (this.postgresActive) {
+      const dbUsers = await postgresStore.loadUsers();
+      for (const u of dbUsers) {
+        this.users.set(u.email.toLowerCase(), u);
+      }
+
+      const dbDocs = await postgresStore.loadDocuments();
+      for (const d of dbDocs) {
+        this.documents.set(d.document_id, d);
+        const cList = await postgresStore.loadChunks(d.document_id);
+        this.documentChunks.set(d.document_id, cList);
+
+        const vecMap = new Map<string, number[]>();
+        for (const c of cList) {
+          if (c.vector) vecMap.set(c.chunk_id, c.vector);
+        }
+        this.chunkVectors.set(d.document_id, vecMap);
+
+        const fList = await postgresStore.loadFacts(d.document_id);
+        this.facts.set(d.document_id, fList);
+        for (const f of fList) {
+          this.factById.set(`${d.document_id}:${f.fact_id}`, f);
+          this.factById.set(f.fact_id, f);
+        }
+      }
+
+      const dbJobs = await postgresStore.loadJobs();
+      for (const j of dbJobs) {
+        this.jobs.set(j.job_id, j);
+      }
+
+      const dbOutputs = await postgresStore.loadOutputs();
+      for (const o of dbOutputs) {
+        this.outputs.set(o.output_id, o);
+      }
+
+      const dbProv = await postgresStore.loadProvenance();
+      for (const p of dbProv) {
+        this.provenanceRecords.set(p.provenance_id, p);
+        this.verificationIndex.set(p.verification_id, p.provenance_id);
+      }
+
+      const dbLogs = await postgresStore.loadAuditLogs(100);
+      if (dbLogs.length > 0) {
+        this.auditLogs = dbLogs;
+      }
+    }
+
+    // 1. Seed RBAC Users (Admin, Editor, Viewer) if empty
+    if (this.users.size === 0) {
+      await this.seedUsersOnly();
+    }
+
+    // If documents already exist in DB or memory, skip demo doc seeding
+    if (this.documents.size > 0 || !config.demoMode) {
+      return;
     }
 
     // 2. Seed Phase 15 Test Documents (Rich-Dad-Poor-Dad PDF, Cybersecurity PDF, Blockchain DOCX, Blackbelt PDF)

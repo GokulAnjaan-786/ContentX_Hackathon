@@ -122,17 +122,25 @@ function getGeminiClient(): GoogleGenAI | null {
   return geminiClient;
 }
 
+let ollamaStatusCache: { status: boolean; timestamp: number } | null = null;
 export async function checkOllamaStatus(): Promise<boolean> {
+  const now = Date.now();
+  if (ollamaStatusCache && now - ollamaStatusCache.timestamp < 5000) {
+    return ollamaStatusCache.status;
+  }
   const baseUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 700);
+    const timer = setTimeout(() => controller.abort(), 150);
     const res = await fetch(`${baseUrl}/api/tags`, {
       signal: controller.signal,
     });
     clearTimeout(timer);
-    return res.ok;
+    const reachable = res.ok;
+    ollamaStatusCache = { status: reachable, timestamp: now };
+    return reachable;
   } catch {
+    ollamaStatusCache = { status: false, timestamp: now };
     return false;
   }
 }

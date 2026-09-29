@@ -9,6 +9,10 @@ services:
       - "3000:3000"
     environment:
       - NODE_ENV=production
+      - CONTENTX_STORAGE_MODE=postgres
+      - DATABASE_URL=postgresql://contentx:contentx_secure_password@postgres-pgvector:5432/contentx_db
+      - DATABASE_REQUIRED=true
+      - JWT_SECRET=production_strong_jwt_secret_key_minimum_32_bytes_contentx
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_GENERATION_MODEL=qwen2.5:7b
       - OLLAMA_EMBEDDING_MODEL=bge-m3:latest

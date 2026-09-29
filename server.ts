@@ -2,11 +2,12 @@ import dotenv from 'dotenv';
 import express, { NextFunction, Request, Response } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
+import { config } from './src/server/config/env.ts';
 import {
   checkOllamaStatus,
   validateGeneratedOutput,
 } from './src/server/services/generationAndValidationService.ts';
-import { dbStore } from './src/server/store/databaseStore.ts';
+import { dbStore, StoredUser } from './src/server/store/databaseStore.ts';
 import {
   AudienceType,
   OutputFormatType,
@@ -24,16 +25,39 @@ interface AuthenticatedRequest extends Request {
 }
 
 const runtimeSettings = {
-  execution_mode: (process.env.OLLAMA_GENERATION_EXECUTION_MODE ||
-    'sequential') as 'sequential' | 'parallel',
-  chunk_target_words: Number(process.env.CHUNK_TARGET_WORDS || 600),
-  chunk_overlap_words: Number(process.env.OLLAMA_OVERLAP_WORDS || process.env.CHUNK_OVERLAP_WORDS || 50),
-  ollama_generation_model: process.env.OLLAMA_GENERATION_MODEL || 'qwen2.5:7b',
-  ollama_embedding_model:
-    process.env.OLLAMA_EMBEDDING_MODEL || 'bge-m3:latest',
-  num_ctx: Number(process.env.OLLAMA_NUM_CTX || 16384),
-  temperature: Number(process.env.OLLAMA_TEMPERATURE || 0.1),
+  execution_mode: config.ollamaExecutionMode,
+  chunk_target_words: config.chunkTargetWords,
+  chunk_overlap_words: config.chunkOverlapWords,
+  ollama_generation_model: config.ollamaGenerationModel,
+  ollama_embedding_model: config.ollamaEmbeddingModel,
+  num_ctx: config.ollamaNumCtx,
+  temperature: config.ollamaTemperature,
 };
+
+// Security Rate Limiter for Auth Routes
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+function authRateLimiter(req: Request, res: Response, next: NextFunction) {
+  const ip = req.ip || req.socket.remoteAddress || '127.0.0.1';
+  const now = Date.now();
+  const windowMs = 60 * 1000;
+  const maxAttempts = 15;
+
+  const current = rateLimitMap.get(ip);
+  if (!current || now > current.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
+    return next();
+  }
+
+  if (current.count >= maxAttempts) {
+    return res.status(429).json({
+      error: 'Too many authentication attempts. Please try again in 1 minute.',
+      code: 'RATE_LIMIT_EXCEEDED',
+    });
+  }
+
+  current.count++;
+  next();
+}
 
 function attachUserMiddleware(
   req: AuthenticatedRequest,
@@ -83,8 +107,16 @@ function requireRole(allowedRoles: UserRole[]) {
       });
     }
     if (!allowedRoles.includes(req.user.role)) {
+      dbStore.logAudit(
+        req.user.email,
+        req.user.role,
+        'AUTHORIZATION_DENIED',
+        req.path,
+        `Attempted to access route requiring ${allowedRoles.join(' or ')}`
+      );
       return res.status(403).json({
         error: `RBAC Policy Denied: Role '${req.user.role}' is not authorized. Required: ${allowedRoles.join(' or ')}.`,
+        code: 'FORBIDDEN',
       });
     }
     next();
@@ -95,13 +127,70 @@ export async function createApp() {
   await dbStore.seedInitialData();
 
   const app = express();
+
+  // Express Security Headers
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
+
+  // CORS Configuration
+  app.use((req, res, next) => {
+    if (config.corsOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', config.corsOrigin);
+    } else if (config.env !== 'production') {
+      const origin = req.headers.origin;
+      if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+      }
+    }
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+    );
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET, POST, PUT, DELETE, OPTIONS'
+    );
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '30mb' }));
   app.use(attachUserMiddleware);
 
   // ============================================================
+  // HEALTH & READINESS ENDPOINTS
+  // ============================================================
+  app.get('/health', (_req: Request, res: Response) => {
+    return res.json({
+      status: 'UP',
+      timestamp: new Date().toISOString(),
+      environment: config.env,
+    });
+  });
+
+  app.get('/health/ready', async (_req: Request, res: Response) => {
+    const ollamaConnected = await checkOllamaStatus();
+    return res.json({
+      status: 'READY',
+      timestamp: new Date().toISOString(),
+      dependencies: {
+        store: 'INITIALIZED',
+        ollama: ollamaConnected ? 'CONNECTED' : 'DISCONNECTED',
+      },
+    });
+  });
+
+  // ============================================================
   // AUTHENTICATION & RBAC ENDPOINTS
   // ============================================================
-  app.post('/api/auth/login', (req: Request, res: Response) => {
+  app.post('/api/auth/login', authRateLimiter, (req: Request, res: Response) => {
     const { email, password, rememberMe } = req.body || {};
     if (!email || !password) {
       return res
@@ -110,17 +199,32 @@ export async function createApp() {
     }
     const stored = dbStore.users.get(String(email).toLowerCase().trim());
     if (!stored) {
+      dbStore.logAudit(
+        String(email).toLowerCase().trim(),
+        'Viewer',
+        'USER_LOGIN_FAILED',
+        'unknown',
+        'Failed login attempt for non-existent account'
+      );
       return res
         .status(401)
         .json({ error: 'Invalid email or password. Please try again.' });
     }
-    const hashed = dbStore.hashPassword(String(password));
-    if (stored.password_hash !== hashed) {
+
+    if (!dbStore.verifyPassword(String(password), stored)) {
+      dbStore.logAudit(
+        stored.email,
+        stored.role,
+        'USER_LOGIN_FAILED',
+        stored.id,
+        'Failed login attempt: invalid password'
+      );
       return res
         .status(401)
         .json({ error: 'Invalid email or password. Please try again.' });
     }
-    const { password_hash: _, ...user } = stored;
+
+    const { password_hash: _, password_salt: __, ...user } = stored;
     const token = dbStore.createToken(user, rememberMe !== false);
     dbStore.logAudit(
       user.email,
@@ -132,9 +236,8 @@ export async function createApp() {
     return res.json({ token, user });
   });
 
-  app.post('/api/auth/register', (req: Request, res: Response) => {
-    const { email, password, name, organization, role, rememberMe } =
-      req.body || {};
+  app.post('/api/auth/register', authRateLimiter, (req: Request, res: Response) => {
+    const { email, password, name, organization, rememberMe } = req.body || {};
     if (!email || !password || !name) {
       return res
         .status(400)
@@ -146,30 +249,38 @@ export async function createApp() {
         .status(409)
         .json({ error: 'An account with this email already exists.' });
     }
-    const assignedRole: UserRole =
-      role === 'Admin' || role === 'Editor' || role === 'Viewer'
-        ? role
-        : 'Editor';
-    const newUser = {
+
+    // CRITICAL SECURITY FIX (CRIT-02 & Objective 1):
+    // Public registration MUST NEVER allow client-selected Admin or Editor roles.
+    // Server enforces safe default least-privilege role: 'Viewer'.
+    const assignedRole: UserRole = 'Viewer';
+
+    const salt = dbStore.generateSalt();
+    const passwordHash = dbStore.hashPassword(String(password), salt);
+
+    const newUser: StoredUser = {
       id: `usr_${Date.now().toString(36)}`,
       email: normalizedEmail,
       name: String(name).trim(),
       organization: String(
-        organization || 'Enterprise Verification Team'
+        organization || 'Institutional Verification User'
       ).trim(),
       role: assignedRole,
       created_at: new Date().toISOString(),
-      password_hash: dbStore.hashPassword(String(password)),
+      password_hash: passwordHash,
+      password_salt: salt,
     };
+
     dbStore.users.set(normalizedEmail, newUser);
-    const { password_hash: _, ...cleanUser } = newUser;
+    const { password_hash: _, password_salt: __, ...cleanUser } = newUser;
     const token = dbStore.createToken(cleanUser, rememberMe !== false);
+
     dbStore.logAudit(
       cleanUser.email,
       cleanUser.role,
       'USER_REGISTER',
       cleanUser.id,
-      `Registered new ${cleanUser.role} account`
+      `Registered new ${cleanUser.role} account (enforced least privilege)`
     );
     return res.status(201).json({ token, user: cleanUser });
   });

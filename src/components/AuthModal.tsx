@@ -223,17 +223,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-slate-700">
-                    RBAC Role
+                    Assigned Role
                   </label>
-                  <select
-                    value={role}
-                    onChange={(e) => setRole(e.target.value as UserRole)}
-                    className="mt-1 w-full border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-600 focus:outline-none"
-                  >
-                    <option value="Admin">Admin (Full Control)</option>
-                    <option value="Editor">Editor (Upload & Generate)</option>
-                    <option value="Viewer">Viewer (Read & Verify Only)</option>
-                  </select>
+                  <div className="mt-1 w-full border border-slate-200 bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700 flex items-center justify-between">
+                    <span>Viewer (Default Least Privilege)</span>
+                    <span className="font-mono text-[10px] text-slate-500">Enforced</span>
+                  </div>
                 </div>
               </div>
             </>
@@ -282,44 +277,46 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </button>
         </form>
 
-        {/* Quick RBAC Role Switcher for Institutional Evaluation */}
-        <div className="mt-5 border-t border-slate-200 pt-4">
-          <div className="text-xs font-medium text-slate-700">
-            Instant RBAC Role Evaluation Accounts
+        {/* Quick RBAC Role Switcher for Development Evaluation Only */}
+        {import.meta.env.DEV && (
+          <div className="mt-5 border-t border-slate-200 pt-4">
+            <div className="text-xs font-medium text-slate-700">
+              Instant RBAC Role Evaluation Accounts (Development Mode)
+            </div>
+            <div className="mt-2 grid grid-cols-3 gap-2">
+              <button
+                type="button"
+                onClick={() =>
+                  handleQuickLogin('admin@contentx.io', 'ContentX#2026')
+                }
+                className="flex items-center justify-center gap-1.5 border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-800 hover:border-slate-400 hover:bg-white whitespace-nowrap"
+              >
+                <Shield className="h-3.5 w-3.5 text-blue-600" />
+                <span>Admin</span>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  handleQuickLogin('editor@contentx.io', 'Editor#2026')
+                }
+                className="flex items-center justify-center gap-1.5 border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-800 hover:border-slate-400 hover:bg-white whitespace-nowrap"
+              >
+                <UserCheck className="h-3.5 w-3.5 text-emerald-600" />
+                <span>Editor</span>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  handleQuickLogin('viewer@contentx.io', 'Viewer#2026')
+                }
+                className="flex items-center justify-center gap-1.5 border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-800 hover:border-slate-400 hover:bg-white whitespace-nowrap"
+              >
+                <Lock className="h-3.5 w-3.5 text-slate-500" />
+                <span>Viewer</span>
+              </button>
+            </div>
           </div>
-          <div className="mt-2 grid grid-cols-3 gap-2">
-            <button
-              type="button"
-              onClick={() =>
-                handleQuickLogin('admin@contentx.io', 'ContentX#2026')
-              }
-              className="flex items-center justify-center gap-1.5 border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-800 hover:border-slate-400 hover:bg-white whitespace-nowrap"
-            >
-              <Shield className="h-3.5 w-3.5 text-blue-600" />
-              <span>Admin</span>
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                handleQuickLogin('editor@contentx.io', 'Editor#2026')
-              }
-              className="flex items-center justify-center gap-1.5 border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-800 hover:border-slate-400 hover:bg-white whitespace-nowrap"
-            >
-              <UserCheck className="h-3.5 w-3.5 text-emerald-600" />
-              <span>Editor</span>
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                handleQuickLogin('viewer@contentx.io', 'Viewer#2026')
-              }
-              className="flex items-center justify-center gap-1.5 border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-800 hover:border-slate-400 hover:bg-white whitespace-nowrap"
-            >
-              <Lock className="h-3.5 w-3.5 text-slate-500" />
-              <span>Viewer</span>
-            </button>
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );

@@ -1,6 +1,8 @@
 import crypto from 'crypto';
 import zlib from 'zlib';
 import { extractText } from 'unpdf';
+import { config } from '../config/env.ts';
+import { chunkRepository } from '../store/repositories/chunkRepository.ts';
 import {
   DocumentChunk,
   RagDecision,
@@ -462,33 +464,7 @@ async function extractPdfPagesClean(
     return splitTextIntoPages(utf8Text, documentId).pages;
   }
 
-  // Primary Method: Mozilla PDF.js via unpdf (page-by-page)
-  try {
-    const uint8 = new Uint8Array(
-      buffer.buffer,
-      buffer.byteOffset,
-      buffer.byteLength
-    );
-    const result = await extractText(uint8, { mergePages: false });
-    if (Array.isArray(result.text) && result.text.length > 0) {
-      const extractedPages = result.text
-        .map((pageText, idx) => ({
-          document_id: documentId,
-          page_number: idx + 1,
-          page: idx + 1,
-          text: sanitizeExtractedSourceText(pageText),
-        }))
-        .filter((p) => p.text.length > 0);
-
-      if (extractedPages.length > 0) {
-        return extractedPages;
-      }
-    }
-  } catch {
-    // Proceed to content-stream decompressor if minimal PDF lacks full xref table
-  }
-
-  // Secondary Method: Decompress PDF page content streams (strictly excluding /ObjStm & /XRef)
+  // Decompress PDF page content streams (strictly excluding /ObjStm & /XRef)
   return extractPdfPagesFromContentStreamsSync(buffer, documentId);
 }
 
@@ -844,6 +820,26 @@ export function splitTextIntoPages(
   return { rawText: normalized, pages };
 }
 
+let ollamaReachableCache: { status: boolean; timestamp: number } | null = null;
+async function isOllamaReachable(baseUrl: string): Promise<boolean> {
+  const now = Date.now();
+  if (ollamaReachableCache && now - ollamaReachableCache.timestamp < 5000) {
+    return ollamaReachableCache.status;
+  }
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 200);
+    const res = await fetch(`${baseUrl}/api/tags`, { signal: controller.signal });
+    clearTimeout(timer);
+    const reachable = res.ok;
+    ollamaReachableCache = { status: reachable, timestamp: now };
+    return reachable;
+  } catch {
+    ollamaReachableCache = { status: false, timestamp: now };
+    return false;
+  }
+}
+
 /**
  * PHASE 10: BGE-M3 1024-Dimensional Embedding Generator with Clean-Text Gate
  * Refuses to embed corrupted PDF internals or U+FFFD replacement characters.
@@ -861,26 +857,28 @@ export async function computeBgeM3Embedding1024(
 
   const embeddingModel = process.env.OLLAMA_EMBEDDING_MODEL || 'bge-m3:latest';
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 900);
-    const res = await fetch(`${ollamaBaseUrl}/api/embeddings`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: embeddingModel, prompt: text }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (res.ok) {
-      const data = (await res.json()) as { embedding?: number[] };
-      if (Array.isArray(data.embedding) && data.embedding.length > 0) {
-        const vec = data.embedding.slice(0, 1024);
-        while (vec.length < 1024) vec.push(0);
-        return { vector: normalizeVector(vec), model: embeddingModel };
+  if (await isOllamaReachable(ollamaBaseUrl)) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 900);
+      const res = await fetch(`${ollamaBaseUrl}/api/embeddings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: embeddingModel, prompt: text }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = (await res.json()) as { embedding?: number[] };
+        if (Array.isArray(data.embedding) && data.embedding.length > 0) {
+          const vec = data.embedding.slice(0, 1024);
+          while (vec.length < 1024) vec.push(0);
+          return { vector: normalizeVector(vec), model: embeddingModel };
+        }
       }
+    } catch {
+      // Local Ollama request failed; use deterministic 1024-dim BGE-M3 feature hashing
     }
-  } catch {
-    // Local Ollama not running in this container; use deterministic 1024-dim BGE-M3 feature hashing
   }
 
   const dim = 1024;
@@ -1046,6 +1044,57 @@ export async function evaluateSelectiveRag(
       ? queryContext
       : 'Verified document summary and key factual findings';
   const { vector: queryVec } = await computeBgeM3Embedding1024(safeQuery);
+
+  // If PostgreSQL storage mode is active, execute pgvector similarity query
+  if (
+    config.storageMode === 'postgres' &&
+    verifiedCleanChunks.length > 0 &&
+    verifiedCleanChunks[0].document_id
+  ) {
+    try {
+      const docId = verifiedCleanChunks[0].document_id;
+      const pgMatches = await chunkRepository.findSimilarChunksPgVector(
+        docId,
+        queryVec,
+        ragRequired ? 4 : verifiedCleanChunks.length
+      );
+      if (pgMatches.length > 0) {
+        const pgSelected = pgMatches.map((m) => ({
+          chunk: m as DocumentChunk,
+          sim: Math.max(0, 1 - m.distance),
+        }));
+
+        const decision: RagDecision = {
+          rag_required: ragRequired,
+          strategy: ragRequired
+            ? 'SELECTIVE_VECTOR_RAG'
+            : 'DIRECT_UNDERSTANDING_PLUS_FACT_REGISTRY',
+          reason: ragRequired
+            ? `Document length (${wordCount} words across ${verifiedCleanChunks.length} validated chunks) exceeds selective RAG threshold (${thresholdWords} words). Activated BGE-M3 1024-dim PostgreSQL pgvector HNSW cosine vector retrieval.`
+            : `Document is concise (${wordCount} words <= ${thresholdWords} word threshold). Using Direct Understanding + Complete Fact Registry from ${verifiedCleanChunks.length} validated chunk(s).`,
+          document_words: wordCount,
+          threshold_words: thresholdWords,
+          chunks_total: verifiedCleanChunks.length,
+          chunks_retrieved: pgSelected.length,
+          embedding_model: 'bge-m3:latest',
+          embedding_dim: 1024,
+          similarity_metric: 'cosine',
+          top_chunk_scores: pgSelected.map((s) => ({
+            chunk_id: s.chunk.chunk_id,
+            page_number: s.chunk.page_number,
+            cosine_similarity: s.sim,
+          })),
+        };
+
+        return {
+          decision,
+          retrievedChunks: pgSelected.map((s) => s.chunk),
+        };
+      }
+    } catch {
+      // Fallback to in-memory cosine scan if PostgreSQL is disconnected in test
+    }
+  }
 
   const scored = verifiedCleanChunks.map((chunk) => {
     const vec = fullVectors.get(chunk.chunk_id) || [];
