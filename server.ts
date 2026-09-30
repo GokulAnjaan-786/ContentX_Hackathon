@@ -9,6 +9,7 @@ import {
 } from './src/server/services/generationAndValidationService.ts';
 import { sseBroker } from './src/server/services/sseBrokerService.ts';
 import { dbStore, StoredUser } from './src/server/store/databaseStore.ts';
+import { checkDatabaseHealth } from './src/server/store/postgres/postgresClient.ts';
 import {
   AudienceType,
   OutputFormatType,
@@ -135,12 +136,42 @@ export async function createApp() {
 
   const app = express();
 
-  // Express Security Headers
-  app.use((_req, res, next) => {
+  // Express Production Security Headers (nosniff, frame protection, CSP, HSTS, Referrer & Permissions Policy)
+  app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('X-XSS-Protection', '1; mode=block');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(), microphone=(), geolocation=()'
+    );
+
+    // Content Security Policy (CSP) scoped for Vite SPA + SSE streams
+    const cspDirectives = [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com data:",
+      "img-src 'self' data: blob: https:",
+      "connect-src 'self' ws: wss: http://localhost:* http://127.0.0.1:*",
+      "frame-ancestors 'none'",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+    ].join('; ');
+    res.setHeader('Content-Security-Policy', cspDirectives);
+
+    // HSTS (Strict-Transport-Security): Enforced when running in production under TLS/HTTPS
+    if (
+      config.env === 'production' &&
+      (req.secure || req.headers['x-forwarded-proto'] === 'https')
+    ) {
+      res.setHeader(
+        'Strict-Transport-Security',
+        'max-age=31536000; includeSubDomains'
+      );
+    }
     next();
   });
 
@@ -172,26 +203,51 @@ export async function createApp() {
   app.use(attachUserMiddleware);
 
   // ============================================================
-  // HEALTH & READINESS ENDPOINTS
+  // HEALTH & READINESS ENDPOINTS (LIVENESS vs READINESS)
   // ============================================================
+  
+  // 1. GET /health - Lightweight Liveness Probe for Container Orchestrators
   app.get('/health', (_req: Request, res: Response) => {
     return res.json({
-      status: 'UP',
+      status: 'ok',
+      service: 'contentx-platform',
       timestamp: new Date().toISOString(),
       environment: config.env,
     });
   });
 
-  app.get('/health/ready', async (_req: Request, res: Response) => {
+  // 2. GET /readiness - Readiness Probe verifying Database and AI Provider Connectivity
+  app.get('/readiness', async (_req: Request, res: Response) => {
+    let dbOk = false;
+    if (config.storageMode === 'postgres') {
+      const dbHealth = await checkDatabaseHealth();
+      dbOk = dbHealth.connected;
+    } else {
+      dbOk = dbStore.initialized;
+    }
+
     const ollamaConnected = await checkOllamaStatus();
-    return res.json({
-      status: 'READY',
+    const ready = dbOk;
+
+    const payload = {
+      status: ready ? 'ready' : 'not_ready',
       timestamp: new Date().toISOString(),
-      dependencies: {
-        store: 'INITIALIZED',
-        ollama: ollamaConnected ? 'CONNECTED' : 'DISCONNECTED',
+      checks: {
+        database: dbOk ? 'ok' : 'unavailable',
+        storage_mode: config.storageMode,
+        ollama: ollamaConnected ? 'ok' : 'degraded_offline_fallback',
       },
-    });
+    };
+
+    if (!ready && config.databaseRequired) {
+      return res.status(503).json(payload);
+    }
+    return res.status(200).json(payload);
+  });
+
+  // Backward-compatible alias
+  app.get('/health/ready', (req: Request, res: Response) => {
+    res.redirect('/readiness');
   });
 
   // ============================================================
@@ -683,8 +739,9 @@ export async function createApp() {
     return res.json({ job, outputs });
   });
 
-  app.get(
-    '/api/generation/:job_id/events',
+  // Issue short-lived one-time ticket for SSE EventSource connection
+  app.post(
+    '/api/generation/:job_id/events/ticket',
     requireAuth,
     (req: AuthenticatedRequest, res: Response) => {
       const jobId = req.params.job_id;
@@ -707,14 +764,103 @@ export async function createApp() {
           currentUser.role,
           'AUTHORIZATION_DENIED',
           jobId,
-          'Attempted to access SSE progress stream for unauthorized generation job'
+          'Attempted to request SSE ticket for unauthorized generation job'
         );
         return res.status(403).json({
           error:
-            'RBAC Policy Denied: You are not authorized to view progress for this job.',
+            'RBAC Policy Denied: You are not authorized to request a ticket for this job.',
           code: 'FORBIDDEN',
         });
       }
+
+      const tkt = sseBroker.createTicket(
+        jobId,
+        currentUser.email,
+        currentUser.role,
+        30
+      );
+
+      return res.status(201).json({
+        ticket: tkt.ticket,
+        job_id: jobId,
+        expires_in_seconds: 30,
+      });
+    }
+  );
+
+  app.get('/api/generation/:job_id/events', (req: AuthenticatedRequest, res: Response) => {
+    const jobId = req.params.job_id;
+    const job = dbStore.jobs.get(jobId);
+
+    if (!job) {
+      return res.status(404).json({ error: 'Generation job not found.' });
+    }
+
+    let authenticatedUser: User | undefined = req.user;
+    const ticketParam = req.query.ticket as string | undefined;
+
+    if (ticketParam) {
+      const ticketCheck = sseBroker.consumeTicket(ticketParam, jobId);
+      if (!ticketCheck.valid || !ticketCheck.ticket) {
+        return res.status(401).json({
+          error: ticketCheck.reason || 'Invalid or expired SSE ticket.',
+          code: 'INVALID_SSE_TICKET',
+        });
+      }
+      const tkt = ticketCheck.ticket;
+      authenticatedUser = {
+        id: `usr_${tkt.userEmail}`,
+        email: tkt.userEmail,
+        name: tkt.userEmail,
+        organization: 'Institutional User',
+        role: tkt.userRole,
+        created_at: new Date(tkt.createdAt).toISOString(),
+      };
+    } else if (!authenticatedUser) {
+      if (config.env === 'production') {
+        return res.status(401).json({
+          error:
+            'In production mode, SSE stream connections require a valid short-lived ticket (?ticket=) or Bearer authorization.',
+          code: 'SSE_TICKET_REQUIRED',
+        });
+      }
+      // Development fallback: check query token if present
+      const queryToken = req.query.token as string | undefined;
+      if (queryToken) {
+        const verification = dbStore.verifySessionToken(queryToken);
+        if (verification.valid && verification.user) {
+          authenticatedUser = verification.user;
+        }
+      }
+    }
+
+    if (!authenticatedUser) {
+      return res.status(401).json({
+        error: 'Authentication required. Please provide a valid SSE ticket or session token.',
+        code: 'UNAUTHENTICATED',
+      });
+    }
+
+    const isOwner = job.issuer ? job.issuer === authenticatedUser.email : true;
+    const isAuthorized =
+      authenticatedUser.role === 'Admin' ||
+      authenticatedUser.role === 'Editor' ||
+      isOwner;
+
+    if (!isAuthorized) {
+      dbStore.logAudit(
+        authenticatedUser.email,
+        authenticatedUser.role,
+        'AUTHORIZATION_DENIED',
+        jobId,
+        'Attempted to access SSE progress stream for unauthorized generation job'
+      );
+      return res.status(403).json({
+        error:
+          'RBAC Policy Denied: You are not authorized to view progress for this job.',
+        code: 'FORBIDDEN',
+      });
+    }
 
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache, no-transform');

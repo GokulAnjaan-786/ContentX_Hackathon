@@ -1,11 +1,23 @@
-import { GenerationProgressEvent } from '../../types/contentx.ts';
+import crypto from 'crypto';
+import { GenerationProgressEvent, UserRole } from '../../types/contentx.ts';
 
 type EventListener = (event: GenerationProgressEvent) => void;
+
+export interface SseTicket {
+  ticket: string;
+  jobId: string;
+  userEmail: string;
+  userRole: UserRole;
+  createdAt: number;
+  expiresAt: number;
+  consumed: boolean;
+}
 
 class SseBrokerService {
   private subscribers = new Map<string, Set<EventListener>>();
   private lastEvents = new Map<string, GenerationProgressEvent>();
   private eventSequenceMap = new Map<string, number>();
+  private tickets = new Map<string, SseTicket>();
 
   /**
    * Subscribe a client listener to live generation progress events for a specific jobId.
@@ -39,7 +51,13 @@ class SseBrokerService {
    * Publish a progress event to all active SSE subscribers for a jobId.
    * Non-blocking, isolated transient delivery. Safe if no subscribers exist.
    */
-  public publish(jobId: string, eventPartial: Omit<GenerationProgressEvent, 'eventId' | 'timestamp'> & { eventId?: string; timestamp?: string }): GenerationProgressEvent {
+  public publish(
+    jobId: string,
+    eventPartial: Omit<GenerationProgressEvent, 'eventId' | 'timestamp'> & {
+      eventId?: string;
+      timestamp?: string;
+    }
+  ): GenerationProgressEvent {
     const nextSeq = (this.eventSequenceMap.get(jobId) || 0) + 1;
     this.eventSequenceMap.set(jobId, nextSeq);
 
@@ -58,7 +76,10 @@ class SseBrokerService {
         try {
           listener(fullEvent);
         } catch (err) {
-          console.warn(`[SSE BROKER WARNING] Exception in listener for job ${jobId}:`, err);
+          console.warn(
+            `[SSE BROKER WARNING] Exception in listener for job ${jobId}:`,
+            err
+          );
         }
       }
     }
@@ -71,6 +92,82 @@ class SseBrokerService {
    */
   public getLastEvent(jobId: string): GenerationProgressEvent | null {
     return this.lastEvents.get(jobId) || null;
+  }
+
+  /**
+   * Generate a short-lived single-use ticket for SSE EventSource connections.
+   */
+  public createTicket(
+    jobId: string,
+    userEmail: string,
+    userRole: UserRole,
+    ttlSeconds = 30
+  ): SseTicket {
+    this.cleanExpiredTickets();
+    const ticketId = `tkt_${crypto.randomBytes(24).toString('hex')}`;
+    const now = Date.now();
+    const ticket: SseTicket = {
+      ticket: ticketId,
+      jobId,
+      userEmail,
+      userRole,
+      createdAt: now,
+      expiresAt: now + ttlSeconds * 1000,
+      consumed: false,
+    };
+    this.tickets.set(ticketId, ticket);
+    return ticket;
+  }
+
+  /**
+   * Consume and validate a short-lived SSE ticket.
+   * Single-use: once consumed, the ticket cannot be reused.
+   */
+  public consumeTicket(
+    ticketId: string,
+    targetJobId: string
+  ): { valid: boolean; ticket?: SseTicket; reason?: string } {
+    this.cleanExpiredTickets();
+    if (!ticketId || typeof ticketId !== 'string') {
+      return { valid: false, reason: 'Ticket parameter is missing.' };
+    }
+
+    const tkt = this.tickets.get(ticketId);
+    if (!tkt) {
+      return { valid: false, reason: 'Invalid or unknown SSE ticket.' };
+    }
+
+    if (tkt.consumed) {
+      return { valid: false, reason: 'SSE ticket has already been consumed.' };
+    }
+
+    if (Date.now() > tkt.expiresAt) {
+      this.tickets.delete(ticketId);
+      return { valid: false, reason: 'SSE ticket has expired.' };
+    }
+
+    if (tkt.jobId !== targetJobId) {
+      return {
+        valid: false,
+        reason: 'SSE ticket is bound to a different generation job.',
+      };
+    }
+
+    // Mark as consumed (single-use enforcement)
+    tkt.consumed = true;
+    return { valid: true, ticket: tkt };
+  }
+
+  /**
+   * Remove expired tickets to prevent memory growth.
+   */
+  private cleanExpiredTickets(): void {
+    const now = Date.now();
+    for (const [id, t] of Array.from(this.tickets.entries())) {
+      if (now > t.expiresAt) {
+        this.tickets.delete(id);
+      }
+    }
   }
 
   /**
