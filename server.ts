@@ -576,8 +576,8 @@ export async function createApp() {
     const documentId = req.query.documentId as string | undefined;
     const allFacts: Array<
       ReturnType<typeof dbStore.facts.get> extends (infer U)[] | undefined
-        ? U & { document_name?: string; is_demo?: boolean }
-        : never
+      ? U & { document_name?: string; is_demo?: boolean }
+      : never
     > = [];
 
     for (const [docId, docFacts] of dbStore.facts.entries()) {
@@ -732,8 +732,8 @@ export async function createApp() {
         validation.overall_status === 'FAILED'
           ? 'failed'
           : validation.overall_status === 'WARNING'
-          ? 'completed_with_warnings'
-          : 'completed';
+            ? 'completed_with_warnings'
+            : 'completed';
 
       return res.json({ output, validation });
     }
@@ -947,15 +947,15 @@ export async function createApp() {
     const ollamaConnected = await checkOllamaStatus();
     const geminiConfigured = Boolean(
       process.env.GEMINI_API_KEY &&
-        process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
+      process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
     );
 
     const status: ProviderConfigStatus = {
       generation_provider: ollamaConnected
         ? 'ollama_local'
         : geminiConfigured
-        ? 'gemini_server_grounded'
-        : 'deterministic_compiler',
+          ? 'gemini_server_grounded'
+          : 'deterministic_compiler',
       ollama_url: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
       ollama_connected: ollamaConnected,
       ollama_generation_model: runtimeSettings.ollama_generation_model,

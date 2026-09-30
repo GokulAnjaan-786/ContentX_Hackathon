@@ -820,22 +820,23 @@ export function splitTextIntoPages(
   return { rawText: normalized, pages };
 }
 
-let ollamaReachableCache: { status: boolean; timestamp: number } | null = null;
+const ollamaReachableCache = new Map<string, { status: boolean; timestamp: number }>();
 async function isOllamaReachable(baseUrl: string): Promise<boolean> {
   const now = Date.now();
-  if (ollamaReachableCache && now - ollamaReachableCache.timestamp < 5000) {
-    return ollamaReachableCache.status;
+  const cached = ollamaReachableCache.get(baseUrl);
+  if (cached && now - cached.timestamp < 10000) {
+    return cached.status;
   }
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 200);
+    const timer = setTimeout(() => controller.abort(), 100);
     const res = await fetch(`${baseUrl}/api/tags`, { signal: controller.signal });
     clearTimeout(timer);
     const reachable = res.ok;
-    ollamaReachableCache = { status: reachable, timestamp: now };
+    ollamaReachableCache.set(baseUrl, { status: reachable, timestamp: now });
     return reachable;
   } catch {
-    ollamaReachableCache = { status: false, timestamp: now };
+    ollamaReachableCache.set(baseUrl, { status: false, timestamp: now });
     return false;
   }
 }
@@ -856,8 +857,19 @@ export async function computeBgeM3Embedding1024(
   }
 
   const embeddingModel = process.env.OLLAMA_EMBEDDING_MODEL || 'bge-m3:latest';
+  const isProd =
+    (process.env.NODE_ENV || '').toLowerCase() === 'production' ||
+    config.env === 'production';
+  const reachable = await isOllamaReachable(ollamaBaseUrl);
 
-  if (await isOllamaReachable(ollamaBaseUrl)) {
+  // PHASE 3 STEP 2C: Production embedding safety (Fail closed in production if Ollama unavailable)
+  if (isProd && !reachable) {
+    throw new Error(
+      'BGE-M3 Embedding Fail-Closed: Ollama embedding service is unreachable in production mode.'
+    );
+  }
+
+  if (reachable) {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 900);
@@ -876,8 +888,18 @@ export async function computeBgeM3Embedding1024(
           return { vector: normalizeVector(vec), model: embeddingModel };
         }
       }
-    } catch {
-      // Local Ollama request failed; use deterministic 1024-dim BGE-M3 feature hashing
+      if (isProd) {
+        throw new Error(
+          'BGE-M3 Embedding Fail-Closed: Ollama embedding response invalid in production mode.'
+        );
+      }
+    } catch (err: any) {
+      if (isProd) {
+        throw new Error(
+          `BGE-M3 Embedding Fail-Closed: ${err?.message || 'Ollama embedding failed in production mode.'}`
+        );
+      }
+      // Local Ollama request failed in dev/test; fallback to deterministic feature hashing
     }
   }
 

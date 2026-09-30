@@ -122,6 +122,9 @@ class ContentXStore {
         return { valid: false };
       }
       const [id, email, role, expiresAtStr, sig] = parts;
+      if (!sig || sig.length !== 64 || !/^[a-fA-F0-9]{64}$/.test(sig)) {
+        return { valid: false };
+      }
       const payload = `${id}|${email}|${role}|${expiresAtStr}`;
       const expectedSig = computeSha256(
         `${payload}|${config.jwtSecret}`

@@ -14,6 +14,7 @@ import {
   RagDecision,
 } from '../../types/contentx.ts';
 import {
+  computeSha256,
   PDF_INTERNAL_ARTIFACT_PATTERNS,
   validateChunkQuality,
 } from './ingestionService.ts';
@@ -535,6 +536,16 @@ export function buildUnderstandingAndFactRegistry(
   return { understanding, facts };
 }
 
+const contextBundleCache = new Map<string, ContextBundle>();
+
+export function getContextBundleCacheStats(): { size: number } {
+  return { size: contextBundleCache.size };
+}
+
+export function clearContextBundleCache(): void {
+  contextBundleCache.clear();
+}
+
 /**
  * Context Builder (Section 12)
  * Prioritizes:
@@ -544,6 +555,7 @@ export function buildUnderstandingAndFactRegistry(
  * 4. entity relevance
  * 5. retrieval similarity
  * Never blindly selects only the first N facts.
+ * Features safe composite context bundle caching (Phase 3 Step 2E).
  */
 export function buildGroundedContext(
   documentId: string,
@@ -554,6 +566,16 @@ export function buildGroundedContext(
   retrievedChunks: DocumentChunk[],
   ragDecision: RagDecision
 ): ContextBundle {
+  const factsFingerprint = computeSha256(
+    allFacts.map((f) => `${f.fact_id}:${f.statement}`).join('|')
+  );
+  const formatsKey = [...selectedFormats].sort().join(',');
+  const cacheKey = `ctx_${documentId}_${domain}_${audience}_${formatsKey}_${factsFingerprint.slice(0, 16)}`;
+
+  if (contextBundleCache.has(cacheKey)) {
+    return contextBundleCache.get(cacheKey)!;
+  }
+
   // PHASE 10: Inspect actual retrieved chunk text & fact text before building context
   const cleanRetrievedChunks = retrievedChunks.filter(
     (c) => validateChunkQuality(c.source_text).valid
@@ -622,7 +644,7 @@ export function buildGroundedContext(
       'Adapt tone to the detected domain while maintaining strict factual equivalence across all formats.',
   };
 
-  return {
+  const bundle: ContextBundle = {
     document_id: documentId,
     audience,
     domain,
@@ -632,6 +654,9 @@ export function buildGroundedContext(
     truth_compression_directive: audienceDirectives[audience],
     source_delimiter_wrapped: true,
   };
+
+  contextBundleCache.set(cacheKey, bundle);
+  return bundle;
 }
 
 function uniqueMatches(text: string, regex: RegExp): string[] {
