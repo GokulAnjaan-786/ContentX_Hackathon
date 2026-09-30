@@ -5,48 +5,90 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: contentx-web:latest
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
       - NODE_ENV=production
       - CONTENTX_STORAGE_MODE=postgres
-      - DATABASE_URL=postgresql://contentx:contentx_secure_password@postgres-pgvector:5432/contentx_db
+      - POSTGRES_HOST=postgres-pgvector
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-contentx_db}
+      - POSTGRES_USER=${POSTGRES_USER:-contentx}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-contentx_secure_password}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-contentx}:${POSTGRES_PASSWORD:-contentx_secure_password}@postgres-pgvector:5432/${POSTGRES_DB:-contentx_db}
       - DATABASE_REQUIRED=true
-      - JWT_SECRET=production_strong_jwt_secret_key_minimum_32_bytes_contentx
+      - JWT_SECRET=${JWT_SECRET:-production_strong_jwt_secret_key_minimum_32_bytes_contentx}
       - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_GENERATION_MODEL=qwen2.5:7b
-      - OLLAMA_EMBEDDING_MODEL=bge-m3:latest
-      - OLLAMA_GENERATION_EXECUTION_MODE=sequential
+      - OLLAMA_GENERATION_MODEL=${OLLAMA_GENERATION_MODEL:-qwen2.5:7b}
+      - OLLAMA_EMBEDDING_MODEL=${OLLAMA_EMBEDDING_MODEL:-bge-m3:latest}
+      - OLLAMA_GENERATION_EXECUTION_MODE=${OLLAMA_GENERATION_EXECUTION_MODE:-sequential}
       - OLLAMA_NUM_CTX=16384
       - OLLAMA_TEMPERATURE=0.1
       - CHUNK_TARGET_WORDS=600
       - CHUNK_OVERLAP_WORDS=50
     depends_on:
-      - postgres-pgvector
-      - redis
+      postgres-pgvector:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - contentx-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/provider-status"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   postgres-pgvector:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: contentx
-      POSTGRES_PASSWORD: contentx_secure_password
-      POSTGRES_DB: contentx_db
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-contentx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-contentx_secure_password}
+      POSTGRES_DB: ${POSTGRES_DB:-contentx_db}
     volumes:
       - pgvector_data:/var/lib/postgresql/data
+    networks:
+      - contentx-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-contentx} -d ${POSTGRES_DB:-contentx_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    networks:
+      - contentx-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   ollama:
     image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
+    restart: unless-stopped
     volumes:
       - ollama_models:/root/.ollama
+    networks:
+      - contentx-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  contentx-network:
+    driver: bridge
 
 volumes:
   pgvector_data:

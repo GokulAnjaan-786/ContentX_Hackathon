@@ -1,0 +1,22 @@
+# ContentX Development Override Compose File
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+version: '3.9'
+
+services:
+  contentx-web:
+    environment:
+      - NODE_ENV=development
+      - CONTENTX_DEMO_MODE=true
+
+  postgres-pgvector:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  ollama:
+    ports:
+      - "11434:11434"
