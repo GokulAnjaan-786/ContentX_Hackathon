@@ -42,6 +42,37 @@ export type ProcessingStatus =
   | 'completed_with_warnings'
   | 'failed';
 
+export type GenerationEventStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export type GenerationEventStage =
+  | 'queued'
+  | 'preparing'
+  | 'understanding'
+  | 'context_building'
+  | 'generating'
+  | 'validating'
+  | 'provenance'
+  | 'completed'
+  | 'failed';
+
+export interface GenerationProgressEvent {
+  jobId: string;
+  eventId: string;
+  timestamp: string;
+  status: GenerationEventStatus;
+  stage: GenerationEventStage;
+  format?: OutputFormatType;
+  completedFormats: number;
+  totalFormats: number;
+  progressPercent: number;
+  message: string;
+}
+
 export type ValidationGateStatus = 'PASSED' | 'WARNING' | 'FAILED';
 
 export type CertaintyLevel =

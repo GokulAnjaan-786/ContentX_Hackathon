@@ -7,6 +7,7 @@ import {
   checkOllamaStatus,
   validateGeneratedOutput,
 } from './src/server/services/generationAndValidationService.ts';
+import { sseBroker } from './src/server/services/sseBrokerService.ts';
 import { dbStore, StoredUser } from './src/server/store/databaseStore.ts';
 import {
   AudienceType,
@@ -64,9 +65,15 @@ function attachUserMiddleware(
   _res: Response,
   next: NextFunction
 ) {
+  let token: string | null = null;
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
+    token = authHeader.slice(7).trim();
+  } else if (req.query && typeof req.query.token === 'string') {
+    token = req.query.token.trim();
+  }
+
+  if (token) {
     const verification = dbStore.verifySessionToken(token);
     if (verification.valid && verification.user) {
       req.user = verification.user;
@@ -675,6 +682,110 @@ export async function createApp() {
       .filter(Boolean);
     return res.json({ job, outputs });
   });
+
+  app.get(
+    '/api/generation/:job_id/events',
+    requireAuth,
+    (req: AuthenticatedRequest, res: Response) => {
+      const jobId = req.params.job_id;
+      const job = dbStore.jobs.get(jobId);
+
+      if (!job) {
+        return res.status(404).json({ error: 'Generation job not found.' });
+      }
+
+      const currentUser = req.user!;
+      const isOwner = job.issuer ? job.issuer === currentUser.email : true;
+      const isAuthorized =
+        currentUser.role === 'Admin' ||
+        currentUser.role === 'Editor' ||
+        isOwner;
+
+      if (!isAuthorized) {
+        dbStore.logAudit(
+          currentUser.email,
+          currentUser.role,
+          'AUTHORIZATION_DENIED',
+          jobId,
+          'Attempted to access SSE progress stream for unauthorized generation job'
+        );
+        return res.status(403).json({
+          error:
+            'RBAC Policy Denied: You are not authorized to view progress for this job.',
+          code: 'FORBIDDEN',
+        });
+      }
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+
+      let initialEvent = sseBroker.getLastEvent(jobId);
+      if (!initialEvent) {
+        const total = job.selected_formats.length;
+        const done = job.completed_formats.length + job.failed_formats.length;
+        const stage =
+          job.status === 'completed' || job.status === 'completed_with_warnings'
+            ? 'completed'
+            : job.status === 'failed'
+            ? 'failed'
+            : done > 0
+            ? 'validating'
+            : 'preparing';
+
+        initialEvent = {
+          jobId,
+          eventId: `evt_${jobId}_init`,
+          timestamp: new Date().toISOString(),
+          status:
+            job.status === 'completed' || job.status === 'completed_with_warnings'
+              ? 'completed'
+              : job.status === 'failed'
+              ? 'failed'
+              : 'running',
+          stage,
+          completedFormats: job.completed_formats.length,
+          totalFormats: total,
+          progressPercent:
+            job.status === 'completed' || job.status === 'completed_with_warnings'
+              ? 100
+              : job.status === 'failed'
+              ? 0
+              : Math.min(90, 15 + Math.round((done / total) * 70)),
+          message: job.current_step || 'Processing generation job',
+        };
+      }
+
+      res.write(`id: ${initialEvent.eventId}\n`);
+      res.write(`event: message\n`);
+      res.write(`data: ${JSON.stringify(initialEvent)}\n\n`);
+
+      const unsubscribe = sseBroker.subscribe(jobId, (event) => {
+        try {
+          res.write(`id: ${event.eventId}\n`);
+          res.write(`event: message\n`);
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        } catch {
+          // Socket closed
+        }
+      });
+
+      const heartbeatInterval = setInterval(() => {
+        try {
+          res.write(`: heartbeat ${Date.now()}\n\n`);
+        } catch {
+          clearInterval(heartbeatInterval);
+        }
+      }, 15000);
+
+      req.on('close', () => {
+        clearInterval(heartbeatInterval);
+        unsubscribe();
+      });
+    }
+  );
 
   app.get('/api/outputs', (req: Request, res: Response) => {
     const includeDemo = req.query.includeDemo !== 'false';

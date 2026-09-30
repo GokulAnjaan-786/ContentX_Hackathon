@@ -19,6 +19,8 @@ import {
   scanDocumentSecurity,
 } from '../services/ingestionService.ts';
 import { dbStore } from '../store/databaseStore.ts';
+import { runPhase3OptimizationTests } from './phase3OptimizationTests.ts';
+import { runPhase3SseTests } from './phase3SseTests.ts';
 
 async function runAllContentXTests() {
   console.log('============================================================');
@@ -449,6 +451,9 @@ async function runAllContentXTests() {
   console.log('============================================================');
   console.log('ALL 26 CONTENTX AUTH, EDITORIAL & FORENSIC TEST SUITES PASSED');
   console.log('============================================================');
+
+  await runPhase3OptimizationTests();
+  await runPhase3SseTests();
 }
 
 runAllContentXTests().catch((err) => {

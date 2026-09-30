@@ -18,6 +18,7 @@ import {
   DocumentChunk,
   FactRegistryItem,
   GeneratedOutputRecord,
+  GenerationProgressEvent,
   OutputFormatType,
   SourceDocument,
   UserRole,
@@ -169,6 +170,11 @@ export const TransformWorkspace: React.FC<TransformWorkspaceProps> = ({
     null
   );
   const [genError, setGenError] = useState<string | null>(null);
+  const [sseProgress, setSseProgress] =
+    useState<GenerationProgressEvent | null>(null);
+  const [sseStatus, setSseStatus] = useState<
+    'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING' | 'COMPLETED' | 'FAILED'
+  >('DISCONNECTED');
   const [reprocessing, setReprocessing] = useState(false);
   const [reprocessBanner, setReprocessBanner] = useState<string | null>(null);
 
@@ -1377,6 +1383,109 @@ export const TransformWorkspace: React.FC<TransformWorkspaceProps> = ({
               );
             })}
           </div>
+
+          {/* REAL-TIME GENERATION PROGRESS (SERVER-SENT EVENTS STREAM) */}
+          {(generating || sseProgress) && (
+            <div className="border border-blue-200 bg-blue-50/50 p-5 space-y-4 font-mono text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-blue-200 pb-3">
+                <div className="flex items-center gap-2">
+                  <Loader2
+                    className={`h-4 w-4 text-blue-700 ${
+                      generating ? 'animate-spin' : ''
+                    }`}
+                  />
+                  <span className="font-bold text-slate-900">
+                    Real-Time Generation Progress (SSE)
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-500">Connection:</span>
+                  <span
+                    className={`px-2 py-0.5 text-[11px] font-bold rounded ${
+                      sseStatus === 'CONNECTED'
+                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                        : sseStatus === 'RECONNECTING'
+                        ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                        : sseStatus === 'COMPLETED'
+                        ? 'bg-blue-100 text-blue-800 border border-blue-300'
+                        : 'bg-slate-100 text-slate-700 border border-slate-300'
+                    }`}
+                  >
+                    {sseStatus === 'CONNECTED'
+                      ? '● LIVE SSE CONNECTED'
+                      : sseStatus === 'RECONNECTING'
+                      ? '⟳ RECONNECTING...'
+                      : sseStatus}
+                  </span>
+                </div>
+              </div>
+
+              {/* Progress Bar & Status Text */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-slate-700">
+                  <span>
+                    Current Stage:{' '}
+                    <strong className="text-blue-900 uppercase">
+                      {sseProgress?.stage || 'preparing'}
+                    </strong>
+                  </span>
+                  <span className="tabular-nums font-bold text-blue-800">
+                    {sseProgress?.completedFormats || 0} /{' '}
+                    {sseProgress?.totalFormats || selectedFormats.length}{' '}
+                    Formats Completed ({sseProgress?.progressPercent || (generating ? 10 : 100)}%)
+                  </span>
+                </div>
+                <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
+                  <div
+                    className="bg-blue-600 h-2 transition-all duration-300"
+                    style={{
+                      width: `${
+                        sseProgress?.progressPercent || (generating ? 15 : 100)
+                      }%`,
+                    }}
+                  />
+                </div>
+                <div className="text-slate-600 italic">
+                  "{sseProgress?.message || generationStepText || 'Processing sequential transformation...'}"
+                </div>
+              </div>
+
+              {/* Format Execution Progress Checklist */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-blue-200/60">
+                {selectedFormats.map((fmt, idx) => {
+                  const isCompleted = sseProgress
+                    ? sseProgress.completedFormats > idx ||
+                      sseProgress.status === 'completed'
+                    : false;
+                  const isCurrent =
+                    sseProgress?.format === fmt &&
+                    sseProgress?.status === 'running';
+
+                  return (
+                    <div
+                      key={fmt}
+                      className={`flex items-center gap-1.5 p-2 rounded text-[11px] border ${
+                        isCompleted
+                          ? 'border-emerald-300 bg-emerald-50 text-emerald-900 font-semibold'
+                          : isCurrent
+                          ? 'border-blue-400 bg-blue-100 text-blue-900 font-bold animate-pulse'
+                          : 'border-slate-200 bg-white text-slate-500'
+                      }`}
+                    >
+                      {isCompleted ? (
+                        <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                      ) : isCurrent ? (
+                        <Loader2 className="h-3.5 w-3.5 text-blue-600 animate-spin" />
+                      ) : (
+                        <Circle className="h-3.5 w-3.5 text-slate-300" />
+                      )}
+                      <span className="capitalize">{fmt.replace('_', ' ')}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           <div className="flex flex-wrap items-center justify-between gap-4 border-t border-slate-200 pt-4">
             <div className="flex items-center gap-2 text-xs font-mono text-slate-600">

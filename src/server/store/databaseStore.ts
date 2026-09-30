@@ -35,6 +35,7 @@ import {
 } from '../services/ingestionService.ts';
 
 import { config } from '../config/env.ts';
+import { sseBroker } from '../services/sseBrokerService.ts';
 import { postgresStore } from './postgres/postgresStore.ts';
 
 export interface StoredUser extends User {
@@ -432,6 +433,38 @@ class ContentXStore {
     };
     this.jobs.set(jobId, job);
 
+    const totalFormats = orderedFormats.length;
+
+    sseBroker.publish(jobId, {
+      jobId,
+      status: 'queued',
+      stage: 'queued',
+      completedFormats: 0,
+      totalFormats,
+      progressPercent: 0,
+      message: `Job queued for transformation (${totalFormats} format(s) selected)`,
+    });
+
+    sseBroker.publish(jobId, {
+      jobId,
+      status: 'running',
+      stage: 'preparing',
+      completedFormats: 0,
+      totalFormats,
+      progressPercent: 5,
+      message: 'Preparing document & vector retrieval engine',
+    });
+
+    sseBroker.publish(jobId, {
+      jobId,
+      status: 'running',
+      stage: 'understanding',
+      completedFormats: 0,
+      totalFormats,
+      progressPercent: 10,
+      message: 'Evaluating selective RAG & Fact Registry grounding',
+    });
+
     const { decision: ragDecision, retrievedChunks } =
       await evaluateSelectiveRag(
         doc.word_count,
@@ -439,6 +472,16 @@ class ContentXStore {
         vectors,
         `${doc.understanding?.title || doc.filename} ${orderedFormats.join(' ')}`
       );
+
+    sseBroker.publish(jobId, {
+      jobId,
+      status: 'running',
+      stage: 'context_building',
+      completedFormats: 0,
+      totalFormats,
+      progressPercent: 15,
+      message: 'Building grounded context bundle',
+    });
 
     const context = buildGroundedContext(
       doc.document_id,
@@ -457,6 +500,21 @@ class ContentXStore {
     // Sequential execution by default (Section 29: independent failure isolation)
     for (const fmt of orderedFormats) {
       job.current_step = `Generating & validating ${fmt}`;
+      const completedBefore = generatedOutputs.length;
+      sseBroker.publish(jobId, {
+        jobId,
+        status: 'running',
+        stage: 'generating',
+        format: fmt,
+        completedFormats: completedBefore,
+        totalFormats,
+        progressPercent: Math.min(
+          90,
+          15 + Math.round((completedBefore / totalFormats) * 70)
+        ),
+        message: `Generating ${fmt} output via local Ollama (qwen2.5:7b)`,
+      });
+
       try {
         const outRecord = await generateAndValidateSingleOutput({
           jobId,
@@ -523,10 +581,35 @@ class ContentXStore {
         this.provenanceRecords.set(provId, prov);
         this.verificationIndex.set(outRecord.verification_id, provId);
         provenanceList.push(prov);
+
+        const completedAfter = generatedOutputs.length;
+        sseBroker.publish(jobId, {
+          jobId,
+          status: 'running',
+          stage: 'validating',
+          format: fmt,
+          completedFormats: completedAfter,
+          totalFormats,
+          progressPercent: Math.min(
+            92,
+            15 + Math.round((completedAfter / totalFormats) * 70)
+          ),
+          message: `Completed validation & grounding verification for ${fmt}`,
+        });
       } catch (err: any) {
         job.failed_formats.push(fmt);
       }
     }
+
+    sseBroker.publish(jobId, {
+      jobId,
+      status: 'running',
+      stage: 'provenance',
+      completedFormats: generatedOutputs.length,
+      totalFormats,
+      progressPercent: 95,
+      message: 'Generating SHA-256 provenance attestations',
+    });
 
     doc.outputs_count += generatedOutputs.length;
     job.total_latency_ms = Math.max(120, Date.now() - jobStart);
@@ -538,6 +621,28 @@ class ContentXStore {
         : job.failed_formats.length > 0
           ? 'completed_with_warnings'
           : 'completed';
+
+    if (job.status === 'failed') {
+      sseBroker.publish(jobId, {
+        jobId,
+        status: 'failed',
+        stage: 'failed',
+        completedFormats: generatedOutputs.length,
+        totalFormats,
+        progressPercent: 0,
+        message: 'Content transformation failed',
+      });
+    } else {
+      sseBroker.publish(jobId, {
+        jobId,
+        status: 'completed',
+        stage: 'completed',
+        completedFormats: generatedOutputs.length,
+        totalFormats,
+        progressPercent: 100,
+        message: `Successfully generated ${generatedOutputs.length} of ${totalFormats} publication format(s)`,
+      });
+    }
 
     if (this.postgresActive) {
       await postgresStore.saveJob(job);
