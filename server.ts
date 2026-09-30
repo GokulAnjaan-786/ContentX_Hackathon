@@ -10,6 +10,10 @@ import {
 import { sseBroker } from './src/server/services/sseBrokerService.ts';
 import { dbStore, StoredUser } from './src/server/store/databaseStore.ts';
 import { checkDatabaseHealth } from './src/server/store/postgres/postgresClient.ts';
+import { correlationMiddleware } from './src/server/middleware/correlationMiddleware.ts';
+import { metricsRegistry } from './src/server/services/metricsService.ts';
+import { shutdownService } from './src/server/services/shutdownService.ts';
+import { logger } from './src/server/utils/logger.ts';
 import {
   AudienceType,
   OutputFormatType,
@@ -136,6 +140,26 @@ export async function createApp() {
 
   const app = express();
 
+  // Attach Request & Correlation ID Middleware (MUST be first)
+  app.use(correlationMiddleware);
+
+  // Graceful Shutdown Middleware: Reject new non-health requests when shutting down
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (
+      shutdownService.isShutdownRequested() &&
+      req.path !== '/health' &&
+      req.path !== '/readiness' &&
+      req.path !== '/health/ready'
+    ) {
+      res.setHeader('Connection', 'close');
+      return res.status(503).json({
+        error: 'ContentX platform is shutting down. Please try again later.',
+        code: 'SERVER_SHUTTING_DOWN',
+      });
+    }
+    next();
+  });
+
   // Express Production Security Headers (nosniff, frame protection, CSP, HSTS, Referrer & Permissions Policy)
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -187,7 +211,7 @@ export async function createApp() {
     }
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+      'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Request-ID, X-Correlation-ID'
     );
     res.setHeader(
       'Access-Control-Allow-Methods',
@@ -203,7 +227,7 @@ export async function createApp() {
   app.use(attachUserMiddleware);
 
   // ============================================================
-  // HEALTH & READINESS ENDPOINTS (LIVENESS vs READINESS)
+  // HEALTH, READINESS & METRICS ENDPOINTS
   // ============================================================
   
   // 1. GET /health - Lightweight Liveness Probe for Container Orchestrators
@@ -218,6 +242,18 @@ export async function createApp() {
 
   // 2. GET /readiness - Readiness Probe verifying Database and AI Provider Connectivity
   app.get('/readiness', async (_req: Request, res: Response) => {
+    if (shutdownService.isShutdownRequested()) {
+      return res.status(503).json({
+        status: 'shutting_down',
+        timestamp: new Date().toISOString(),
+        checks: {
+          database: 'shutting_down',
+          storage_mode: config.storageMode,
+          ollama: 'shutting_down',
+        },
+      });
+    }
+
     let dbOk = false;
     if (config.storageMode === 'postgres') {
       const dbHealth = await checkDatabaseHealth();
@@ -243,6 +279,12 @@ export async function createApp() {
       return res.status(503).json(payload);
     }
     return res.status(200).json(payload);
+  });
+
+  // 3. GET /metrics - Standard Prometheus Exposition Metrics Endpoint
+  app.get('/metrics', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+    return res.send(metricsRegistry.renderMetrics());
   });
 
   // Backward-compatible alias
@@ -1302,8 +1344,22 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ContentX Platform listening on http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    logger.info(`ContentX Platform listening on http://0.0.0.0:${PORT}`, {
+      event: 'server_start',
+      port: PORT,
+      environment: config.env,
+    });
+  });
+
+  process.on('SIGTERM', () => {
+    logger.info('Received SIGTERM signal', { event: 'signal_received', signal: 'SIGTERM' });
+    shutdownService.initiateShutdown('SIGTERM', server);
+  });
+
+  process.on('SIGINT', () => {
+    logger.info('Received SIGINT signal', { event: 'signal_received', signal: 'SIGINT' });
+    shutdownService.initiateShutdown('SIGINT', server);
   });
 }
 

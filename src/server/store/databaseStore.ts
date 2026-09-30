@@ -33,6 +33,8 @@ import {
   scanDocumentSecurity,
   validateChunkQuality,
 } from '../services/ingestionService.ts';
+import { metricsRegistry } from '../services/metricsService.ts';
+import { logger } from '../utils/logger.ts';
 
 import { config } from '../config/env.ts';
 import { sseBroker } from '../services/sseBrokerService.ts';
@@ -185,9 +187,21 @@ class ContentXStore {
     };
     this.auditLogs.unshift(entry);
 
+    logger.info(`[AUDIT] ${action} on ${resourceId} by ${userEmail}`, {
+      event: 'audit_log',
+      action,
+      userEmail,
+      userRole,
+      resourceId,
+      details,
+    });
+
     if (this.postgresActive) {
       postgresStore.saveAuditLog(entry).catch((err) => {
-        console.warn('[POSTGRES AUDIT WARNING]', err.message);
+        logger.warn('[POSTGRES AUDIT WARNING]', {
+          event: 'db_audit_warning',
+          error: err.message,
+        });
       });
     }
   }
@@ -530,8 +544,9 @@ class ContentXStore {
         generatedOutputs.push(outRecord);
         job.output_ids.push(outRecord.output_id);
 
-        if (outRecord.status === 'failed') {
+        if (outRecord.status === 'failed' || outRecord.validation.overall_status === 'FAILED') {
           job.failed_formats.push(fmt);
+          metricsRegistry.generationValidationFailuresTotal.inc({ format: fmt });
         } else {
           job.completed_formats.push(fmt);
         }
@@ -643,6 +658,15 @@ class ContentXStore {
         message: `Successfully generated ${generatedOutputs.length} of ${totalFormats} publication format(s)`,
       });
     }
+
+    metricsRegistry.generationJobsTotal.inc({
+      status: job.status,
+      domain: job.domain,
+      execution_mode: job.execution_mode,
+    });
+    metricsRegistry.generationDuration.observe(job.total_latency_ms / 1000, {
+      status: job.status,
+    });
 
     if (this.postgresActive) {
       await postgresStore.saveJob(job);

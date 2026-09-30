@@ -3,6 +3,8 @@ import path from 'path';
 import pg from 'pg';
 import { registerType as registerPgVectorType } from 'pgvector/pg';
 import { config } from '../../config/env.ts';
+import { metricsRegistry } from '../../services/metricsService.ts';
+import { logger } from '../../utils/logger.ts';
 
 const { Pool } = pg;
 
@@ -19,7 +21,11 @@ export function getPool(): pg.Pool {
     });
 
     pool.on('error', (err) => {
-      console.error('[POSTGRES POOL ERROR]', err.message);
+      metricsRegistry.databaseErrorsTotal.inc();
+      logger.error('[POSTGRES POOL ERROR]', {
+        event: 'db_pool_error',
+        error: err.message,
+      });
     });
   }
   return pool;
@@ -32,7 +38,10 @@ export async function setupPgVectorTypes(client: pg.PoolClient | pg.Pool): Promi
     pgvectorRegistered = true;
   } catch (err: any) {
     // If pgvector extension is not installed yet or registered on mock, log warning
-    console.warn('[PGVECTOR TYPE NOTICE]', err.message);
+    logger.warn('[PGVECTOR TYPE NOTICE]', {
+      event: 'pgvector_type_warning',
+      error: err.message,
+    });
   }
 }
 
@@ -40,14 +49,26 @@ export async function query<T extends pg.QueryResultRow = any>(
   text: string,
   params?: any[]
 ): Promise<pg.QueryResult<T>> {
-  const p = getPool();
-  return p.query<T>(text, params);
+  metricsRegistry.databaseOperationsTotal.inc({ operation: 'query' });
+  try {
+    const p = getPool();
+    return await p.query<T>(text, params);
+  } catch (err: any) {
+    metricsRegistry.databaseErrorsTotal.inc();
+    throw err;
+  }
 }
 
 export async function getClient(): Promise<pg.PoolClient> {
-  const p = getPool();
-  const client = await p.connect();
-  return client;
+  metricsRegistry.databaseOperationsTotal.inc({ operation: 'connect' });
+  try {
+    const p = getPool();
+    const client = await p.connect();
+    return client;
+  } catch (err: any) {
+    metricsRegistry.databaseErrorsTotal.inc();
+    throw err;
+  }
 }
 
 export async function checkDatabaseHealth(): Promise<{
@@ -110,7 +131,9 @@ export async function runMigrations(): Promise<void> {
         await client.query(
           "INSERT INTO schema_migrations (version) VALUES ('001_initial_schema');"
         );
-        console.log('✓ [POSTGRES MIGRATION] Applied 001_initial_schema.sql successfully');
+        logger.info('✓ [POSTGRES MIGRATION] Applied 001_initial_schema.sql successfully', {
+          event: 'db_migration_applied',
+        });
       }
     }
 
@@ -118,7 +141,10 @@ export async function runMigrations(): Promise<void> {
     await setupPgVectorTypes(client);
   } catch (err: any) {
     await client.query('ROLLBACK;');
-    console.error('[POSTGRES MIGRATION ERROR]', err.message);
+    logger.error('[POSTGRES MIGRATION ERROR]', {
+      event: 'db_migration_error',
+      error: err.message,
+    });
     throw err;
   } finally {
     client.release();

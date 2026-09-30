@@ -22,6 +22,7 @@ import { dbStore } from '../store/databaseStore.ts';
 import { runPhase3OptimizationTests } from './phase3OptimizationTests.ts';
 import { runPhase3SseTests } from './phase3SseTests.ts';
 import { runPhase4HealthAndSecurityTests } from './phase4HealthAndSecurityTests.ts';
+import { runPhase4ObservabilityTests } from './phase4ObservabilityTests.ts';
 
 async function runAllContentXTests() {
   console.log('============================================================');
@@ -456,6 +457,7 @@ async function runAllContentXTests() {
   await runPhase3OptimizationTests();
   await runPhase3SseTests();
   await runPhase4HealthAndSecurityTests();
+  await runPhase4ObservabilityTests();
 }
 
 runAllContentXTests().catch((err) => {

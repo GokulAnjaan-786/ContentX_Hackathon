@@ -111,7 +111,7 @@ export function validateAndLoadConfig(): AppConfig {
     postgresDb,
     postgresUser,
     postgresPassword,
-    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
+    ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
     ollamaGenerationModel: process.env.OLLAMA_GENERATION_MODEL || 'qwen2.5:7b',
     ollamaEmbeddingModel: process.env.OLLAMA_EMBEDDING_MODEL || 'bge-m3:latest',
     ollamaEmbeddingDim: Number(process.env.OLLAMA_EMBEDDING_DIM || 1024),

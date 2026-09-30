@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 import { GenerationProgressEvent, UserRole } from '../../types/contentx.ts';
+import { logger } from '../utils/logger.ts';
+import { metricsRegistry } from './metricsService.ts';
 
 type EventListener = (event: GenerationProgressEvent) => void;
 
@@ -18,6 +20,7 @@ class SseBrokerService {
   private lastEvents = new Map<string, GenerationProgressEvent>();
   private eventSequenceMap = new Map<string, number>();
   private tickets = new Map<string, SseTicket>();
+  private totalConnectionsCount = 0;
 
   /**
    * Subscribe a client listener to live generation progress events for a specific jobId.
@@ -28,6 +31,10 @@ class SseBrokerService {
       this.subscribers.set(jobId, new Set());
     }
     this.subscribers.get(jobId)!.add(listener);
+
+    this.totalConnectionsCount++;
+    metricsRegistry.sseConnectionsTotal.inc();
+    this.updateActiveConnectionsMetric();
 
     return () => {
       this.unsubscribe(jobId, listener);
@@ -45,6 +52,7 @@ class SseBrokerService {
         this.subscribers.delete(jobId);
       }
     }
+    this.updateActiveConnectionsMetric();
   }
 
   /**
@@ -69,6 +77,7 @@ class SseBrokerService {
 
     // Store in memory for immediate state replay on new connection or reconnect
     this.lastEvents.set(jobId, fullEvent);
+    metricsRegistry.sseEventsTotal.inc();
 
     const jobSubscribers = this.subscribers.get(jobId);
     if (jobSubscribers && jobSubscribers.size > 0) {
@@ -76,10 +85,11 @@ class SseBrokerService {
         try {
           listener(fullEvent);
         } catch (err) {
-          console.warn(
-            `[SSE BROKER WARNING] Exception in listener for job ${jobId}:`,
-            err
-          );
+          logger.warn(`[SSE BROKER] Exception in listener for job ${jobId}`, {
+            event: 'sse_listener_error',
+            jobId,
+            error: String(err),
+          });
         }
       }
     }
@@ -177,6 +187,7 @@ class SseBrokerService {
     this.subscribers.delete(jobId);
     this.lastEvents.delete(jobId);
     this.eventSequenceMap.delete(jobId);
+    this.updateActiveConnectionsMetric();
   }
 
   /**
@@ -184,6 +195,38 @@ class SseBrokerService {
    */
   public getSubscriberCount(jobId: string): number {
     return this.subscribers.get(jobId)?.size || 0;
+  }
+
+  /**
+   * Get total active subscribers across all jobs.
+   */
+  public getTotalActiveSubscribers(): number {
+    let total = 0;
+    for (const set of this.subscribers.values()) {
+      total += set.size;
+    }
+    return total;
+  }
+
+  /**
+   * Update Prometheus SSE Active Connections Gauge.
+   */
+  private updateActiveConnectionsMetric(): void {
+    metricsRegistry.sseActiveConnections.set(this.getTotalActiveSubscribers());
+  }
+
+  /**
+   * Graceful shutdown connection cleanup.
+   * Prevents memory leaks and safely clears subscriber listeners.
+   */
+  public closeAllConnections(): void {
+    logger.info('Closing all active SSE connections for graceful shutdown', {
+      event: 'sse_shutdown_cleanup',
+      activeConnections: this.getTotalActiveSubscribers(),
+    });
+    this.subscribers.clear();
+    this.tickets.clear();
+    this.updateActiveConnectionsMetric();
   }
 }
 
